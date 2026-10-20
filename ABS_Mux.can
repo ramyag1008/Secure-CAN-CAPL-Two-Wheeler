@@ -1,0 +1,962 @@
+﻿/*@!Encoding:65001*/
+/*
+ * ABS_MUX_updated.can
+ *
+ * FINAL DBC ABS transmitter
+ * --------------------------
+ * 0x110 ABS_Sensor_Msg  : 8 bytes, MUX, Counter=Byte 6, MAC=Byte 7
+ * 0x120 ABS_Sensor_Error: 8 bytes, Counter=Byte 6, MAC=Byte 7
+ *
+ * 0x110 MUX layouts are taken directly from the final DBC:
+ *   MUX 0: ABS_Msg_Selector, ABS_Active, Brake_Status, Slip_Ratio, 
+ *          Front_wheel_Speed_sensor, Rear_wheel_Speed_sensor
+ *   MUX 1: ABS_Msg_Selector, Yaw_Rate, Brake_Pressure, Brake_Temperature
+ *   MUX 2: ABS_Msg_Selector, Lateral_Acceleration, Longitudinal_Acceleration,
+ *          Steering_wheel_Angle
+ *
+ * SECURITY FORMAT USED BY THE WORKING EMS/ABS PROGRAM:
+ *   Plaintext application bytes = 6 bytes
+ *   PKCS-style padding           = 02 02 -> 8 bytes
+ *   Encrypted bytes              = CAN bytes 0..5
+ *   Counter                      = CAN byte 6
+ *   Truncated MAC                = CAN byte 7
+ *
+ * IMPORTANT:
+ * This is a SIMULATION-NODE CAPL program.
+ * Attach it to ABS_ECU under Simulation Setup, not Test Setup.
+ */
+
+variables
+{
+  // --- Secure Engine Freshness & Cryptography States ---
+  byte rxCounter;
+  byte rxMac;
+  byte calculatedMac;
+  byte expectedCounter[32]; // Tracking array to manage unique sequential freshness values per channel
+
+  message ABS_Sensor_Msg txABSSensor;       /* CAN ID 0x110 */
+  message ABS_Sensor_Error_msg txABSError;   /* CAN ID 0x120 */
+  message 0x7E9 txABS_DiagResp;
+  
+  // --- ASCON State Registers ---
+  dword x0_h; dword x0_l;
+  dword x1_h; dword x1_l; // FIX: Cleaned up structural typo that crashed the compiler
+  dword x2_h; dword x2_l;
+  dword x3_h; dword x3_l;
+  dword x4_h; dword x4_l;
+
+  // --- Intermediate Buffers for Padding & Crypto Operations ---
+  byte raw0; byte raw1; byte raw2; byte raw3; byte raw4; byte raw5;
+  byte pad0; byte pad1; byte pad2; byte pad3; byte pad4; byte pad5; byte pad6; byte pad7;
+  byte cipher0; byte cipher1; byte cipher2; byte cipher3; byte cipher4; byte cipher5;
+
+  byte globalDecryptedBlock_0; byte globalDecryptedBlock_1; byte globalDecryptedBlock_2; 
+  byte globalDecryptedBlock_3; byte globalDecryptedBlock_4; byte globalDecryptedBlock_5; 
+  byte globalDecryptedBlock_6; byte globalDecryptedBlock_7;
+
+  // --- Network Synchronization Tracking ---
+  byte firstFrameABS = 1;
+  byte firstFrame120 = 1;
+  byte firstFrame130 = 1;
+
+  // --- Node Transmission Objects & Timers ---
+  msTimer txAbsSensorTimer;     // 25ms cyclic timer for ABS_Sensor_Msg (0x110)
+  msTimer txAbsErrorTimer;      // 100ms cyclic timer for ABS_Sensor_Error_msg (0x120)
+  byte txCounter110 = 0;        // Freshness Counter for 0x110
+  byte txCounter120 = 0;        // Freshness Counter for 0x120
+  byte muxSelector = 0;
+
+  // Live ABS Values for Simulation
+  double frontWheelSpeed = 45.0;
+  double rearWheelSpeed = 45.2;
+  byte slipRatio = 2;
+  byte brakeStatus = 1;
+  byte absActive = 0;
+
+  double yawRate = 0.5;
+  byte brakePressure = 15;
+  double brakeTemperature = 65.5;
+
+  double steeringWheelAngle = 12.5;
+  double longitudinalAcceleration = 1.2;
+  double lateralAcceleration = 0.1;
+  
+  byte absMilBlinkPattern = 0;
+  byte frontWheelSpeedError = 0;
+  byte rearWheelSpeedError = 0;
+  double distanceFront = 100.0;
+  double distanceRear = 100.0;
+  
+  // Add these to the variables block of ABS_Mux.can
+msTimer tmr_ABSFaultInjector;
+const int c_ABSFaultCheckInterval = 400; // Check for speed anomalies every 400ms
+byte g_AbsActiveFaultState = 0;
+}
+
+/* ======================================================================== */
+/* 1. INITIALIZATION                                                        */
+/* ======================================================================== */
+
+on preStart
+{
+  int i;
+  for(i = 0; i < 32; i++) 
+  {
+    expectedCounter[i] = 0x00;
+  }
+}
+
+on start
+{
+  txCounter110 = 0;
+  txCounter120 = 0;
+
+  ILDisableMsg("ABS_Sensor_Msg");
+  ILDisableMsg("ABS_Sensor_Error_msg");
+  muxSelector = 0;
+
+ // Setup basic simulation starting defaults
+  absActive = 0; 
+  brakeStatus = 1; 
+  slipRatio = 2;
+  frontWheelSpeed = 45.0; 
+  rearWheelSpeed = 45.2;
+  brakePressure = 30;
+  brakeTemperature = 65.5;
+  yawRate = 0.5;
+  steeringWheelAngle = 12.5;
+  longitudinalAcceleration = 1.2;
+  lateralAcceleration = 0.1;
+  absMilBlinkPattern = 0; 
+  frontWheelSpeedError = 0; 
+  rearWheelSpeedError = 0;
+
+  /* Timers trigger configuration per layout specs */
+  setTimer(txAbsSensorTimer, 25);
+  setTimer(txAbsErrorTimer, 100);
+  
+// Add this line inside the "on start" block of ABS_Mux.can
+setTimer(tmr_ABSFaultInjector, c_ABSFaultCheckInterval);
+  
+  write("============================================================");
+  write("ABS_ECU SECURE MUX TRANSMITTER INITIALIZED");
+  write("0x110 ABS_Sensor_Msg : MUX + Encryption + Counter + MAC");
+  write("0x120 ABS_Sensor_Error_msg: Encryption + Counter + MAC");
+  write("0x130 Cluster_indication : Reception Mode Verified and Configured");
+  write("============================================================");
+}
+
+/* ======================================================================== */
+/* ASCON-style permutation - kept identical to the working EMS program     */
+/* ======================================================================== */
+
+dword RotateRight_H(dword h, dword l, int n)
+{
+  if (n < 32)
+    return (h >> n) | (l << (32 - n));
+  return (l >> (n - 32)) | (h << (64 - n));
+}
+
+dword RotateRight_L(dword h, dword l, int n)
+{
+  if (n < 32) return (l >> n) | (h << (32 - n));
+  return (h >> (n - 32)) | (l << (64 - n));
+}
+
+void Ascon_Permute_6()
+{
+  int r;
+  dword t0_h; dword t0_l; dword t1_h; dword t1_l;
+  dword t2_h; dword t2_l; dword t3_h; dword t3_l;
+  dword t4_h; dword t4_l;
+  byte current_rc;
+
+  for (r = 0; r < 6; r++)
+  {
+    switch (r)
+    {
+      case 0: current_rc = 0x9A; break;
+      case 1: current_rc = 0x8B; break;
+      case 2: current_rc = 0x7C; break;
+      case 3: current_rc = 0x6D; break;
+      case 4: current_rc = 0x5E; break;
+      case 5: current_rc = 0x4F; break;
+      default: current_rc = 0x00; break;
+    }
+    x2_l = x2_l ^ current_rc;
+    x0_h = x0_h ^ x4_h; x0_l = x0_l ^ x4_l;
+    x4_h = x4_h ^ x3_h; x4_l = x4_l ^ x3_l;
+    x2_h = x2_h ^ x1_h; x2_l = x2_l ^ x1_l;
+
+    t0_h = ~x0_h; t0_l = ~x0_l;
+    t1_h = ~x1_h; t1_l = ~x1_l;
+    t2_h = ~x2_h; t2_l = ~x2_l;
+    t3_h = ~x3_h; t3_l = ~x3_l;
+    t4_h = ~x4_h; t4_l = ~x4_l;
+
+    x0_h = x0_h ^ (t1_h & x2_h); x0_l = x0_l ^ (t1_l & x2_l);
+    x1_h = x1_h ^ (t2_h & x3_h); x1_l = x1_l ^ (t2_l & x3_l);
+    x2_h = x2_h ^ (t3_h & x4_h); x2_l = x2_l ^ (t3_l & x4_l);
+    x3_h = x3_h ^ (t4_h & t0_h); x3_l = x3_l ^ (t4_l & t0_l);
+    x4_h = x4_h ^ (t0_h & x1_h); x4_l = x4_l ^ (t0_l & x1_l);
+
+    x1_h = x1_h ^ x0_h; x1_l = x1_l ^ x0_l;
+    x0_h = x0_h ^ x4_h; x0_l = x0_l ^ x4_l;
+    x3_h = x3_h ^ x2_h; x3_l = x3_l ^ x2_l;
+    x2_h = ~x2_h;       x2_l = ~x2_l;
+
+    t0_h = x0_h; t0_l = x0_l;
+    x0_h = x0_h ^ RotateRight_H(t0_h,t0_l,19) ^ RotateRight_H(t0_h,t0_l,28);
+    x0_l = x0_l ^ RotateRight_L(t0_h,t0_l,19) ^ RotateRight_L(t0_h,t0_l,28);
+
+    t1_h = x1_h; t1_l = x1_l;
+    x1_h = x1_h ^ RotateRight_H(t1_h,t1_l,61) ^ RotateRight_H(t1_h,t1_l,39);
+    x1_l = x1_l ^ RotateRight_L(t1_h,t1_l,61) ^ RotateRight_L(t1_h,t1_l,39);
+
+    t2_h = x2_h; t2_l = x2_l;
+    x2_h = x2_h ^ RotateRight_H(t2_h,t2_l,1) ^ RotateRight_H(t2_h,t2_l,6);
+    x2_l = x2_l ^ RotateRight_L(t2_h,t2_l,1) ^ RotateRight_L(t2_h,t2_l,6);
+
+    t3_h = x3_h; t3_l = x3_l;
+    x3_h = x3_h ^ RotateRight_H(t3_h,t3_l,10) ^ RotateRight_H(t3_h,t3_l,17);
+    x3_l = x3_l ^ RotateRight_L(t3_h,t3_l,10) ^ RotateRight_L(t3_h,t3_l,17);
+
+    t4_h = x4_h; t4_l = x4_l;
+    x4_h = x4_h ^ RotateRight_H(t4_h,t4_l,7) ^ RotateRight_H(t4_h,t4_l,41);
+    x4_l = x4_l ^ RotateRight_L(t4_h,t4_l,7) ^ RotateRight_L(t4_h,t4_l,41);
+  }
+}
+
+void Ascon_Initialize_State()
+{
+  x0_h = 0x80400c06; x0_l = 0x00000000;
+  x1_h = 0x01020304; x1_l = 0x05060708;
+  x2_h = 0x090A0B0C; x2_l = 0x0D0E0F10;
+  x3_h = 0x00000000; x3_l = 0x00000000;
+  x4_h = 0x00000000; x4_l = 0x00000000;
+  Ascon_Permute_6();
+}
+
+/* ======================================================================== */
+/* Encrypt six application bytes                                            */
+/* ======================================================================== */
+
+void EncryptSixBytes(byte r0, byte r1, byte r2, byte r3, byte r4, byte r5)
+{
+  dword msg_h; dword msg_l;
+  pad0 = raw0; pad1 = raw1; pad2 = raw2; pad3 = raw3; pad4 = raw4; pad5 = raw5;
+  pad6 = 0x02; pad7 = 0x02;
+
+  Ascon_Initialize_State();
+  msg_h = ((dword)pad0 << 24) | ((dword)pad1 << 16) | ((dword)pad2 << 8) | (dword)pad3;
+  msg_l = ((dword)pad4 << 24) | ((dword)pad5 << 16) | ((dword)pad6 << 8) | (dword)pad7;
+
+  x0_h = x0_h ^ msg_h; x0_l = x0_l ^ msg_l;
+  cipher0 = (byte)((x0_h >> 24) & 0xFF); cipher1 = (byte)((x0_h >> 16) & 0xFF);
+  cipher2 = (byte)((x0_h >> 8)  & 0xFF); cipher3 = (byte)(x0_h & 0xFF);
+  cipher4 = (byte)((x0_l >> 24) & 0xFF); cipher5 = (byte)((x0_l >> 16) & 0xFF);
+}
+
+/* ======================================================================== */
+/* 4. MAC GENERATION (COMMON FOR ALL NODES)                                 */
+/* ======================================================================== */
+
+byte Generate_Local_MAC()
+{
+  Ascon_Permute_6();
+  return (byte)(x3_l & 0xFF); 
+}
+
+/* ------------------------------------------------------------------------- */
+/* Generate MAC exactly as the working sender/receiver state operation.     */
+/* ------------------------------------------------------------------------- */
+
+byte Generate_Verification_MAC(byte p0, byte p1, byte p2, byte p3, byte p4, byte p5)
+{
+  dword msg_h; dword msg_l;
+
+  msg_h = (p0 << 24) | (p1 << 16) | (p2 << 8)  | p3;
+  msg_l = (p4 << 24) | (p5 << 16) | (0x02 << 8) | 0x02;
+
+  Ascon_Initialize_State();
+  x0_h = x0_h ^ msg_h;
+  x0_l = x0_l ^ msg_l;
+
+  Ascon_Permute_6();
+  return (byte)(x3_l & 0xFF);
+}
+
+/* ======================================================================== */
+/* Decrypt six encrypted application bytes (Added for 0x130 Rx support)      */
+/* ======================================================================== */
+void Secure_Decrypt(byte c0, byte c1, byte c2, byte c3, byte c4, byte c5)
+{
+  dword cipher_h;
+  dword cipher_l;
+  dword recovered_msg_h;
+  dword recovered_msg_l;
+  byte pad6;
+  byte pad7;
+
+  Ascon_Initialize_State();
+
+  cipher_h = ((dword)c0 << 24) | ((dword)c1 << 16) | ((dword)c2 << 8) | (dword)c3;
+
+  pad6 = 0x02 ^ (byte)((x0_l >> 8) & 0xFF);
+  pad7 = 0x02 ^ (byte)(x0_l & 0xFF);
+
+  cipher_l = ((dword)c4 << 24) | ((dword)c5 << 16) | ((dword)pad6 << 8) | (dword)pad7;
+
+  recovered_msg_h = cipher_h ^ x0_h;
+  recovered_msg_l = cipher_l ^ x0_l;
+
+  globalDecryptedBlock_0 = (byte)((recovered_msg_h >> 24) & 0xFF);
+  globalDecryptedBlock_1 = (byte)((recovered_msg_h >> 16) & 0xFF);
+  globalDecryptedBlock_2 = (byte)((recovered_msg_h >> 8) & 0xFF);
+  globalDecryptedBlock_3 = (byte)(recovered_msg_h & 0xFF);
+
+  globalDecryptedBlock_4 = (byte)((recovered_msg_l >> 24) & 0xFF);
+  globalDecryptedBlock_5 = (byte)((recovered_msg_l >> 16) & 0xFF);
+  globalDecryptedBlock_6 = (byte)((recovered_msg_l >> 8) & 0xFF);
+  globalDecryptedBlock_7 = (byte)(recovered_msg_l & 0xFF);
+
+  x0_h = cipher_h;
+  x0_l = cipher_l;
+}
+
+/* ======================================================================== */
+/* 6. SYSTEM TRANSLATION LAYER (UTILITIES)                                 */
+/* ======================================================================== */
+
+byte GetCounterIndex(dword id)
+{
+  switch (id)
+  {
+    case 0x110: return 1;  // ABS_Sensor_Msg
+    case 0x120: return 2;  // ABS_Sensor_Error_msg
+    case 0x130: return 3;  // Cluster_indication
+    default:    return 31;
+  }
+}
+/* ======================================================================== */
+/* MUX 0x110 payload construction with Raw Input Signal Logging             */
+/* ======================================================================== */
+
+void BuildABS_MUX0()
+{
+  word frontRaw; word rearRaw;
+  frontRaw = (word)(frontWheelSpeed / 0.0078126);
+  rearRaw = (word)(rearWheelSpeed / 0.0078126);
+
+  raw0 = (byte)(0x00 | ((brakeStatus & 0x03) << 5) | ((absActive & 0x01) << 4));
+  raw1 = (byte)(frontRaw & 0xFF);
+  raw2 = (byte)((frontRaw >> 8) & 0xFF);
+  raw3 = (byte)(rearRaw & 0xFF);
+  raw4 = (byte)((rearRaw >> 8) & 0xFF);
+  raw5 = slipRatio;
+
+write("DEBUG [ABS_ECU] [STEP 1] Raw Input Signals (0x110-0x0): FrontRaw=0x%04X | RearRaw=0x%04X | Slip=0x%02X", frontRaw, rearRaw, slipRatio);
+}
+
+void BuildABS_MUX1()
+{
+word yawRaw; word tempRaw;
+yawRaw = (word)((yawRate + 100.0) / 0.05);
+tempRaw = (word)((brakeTemperature + 40.0) / 0.1);
+raw0 = (byte)(0x01 | ((yawRaw & 0x0F) << 4));
+raw1 = (byte)((yawRaw >> 4) & 0xFF);
+raw2 = brakePressure;
+raw3 = (byte)(tempRaw & 0xFF);
+raw4 = (byte)((tempRaw >> 8) & 0xFF);
+raw5 = 0x00;
+write("DEBUG [ABS_ECU] [STEP 1] Raw Input Signals (0x110-0x1): YawRaw=0x%03X | Pressure=0x%02X | TempRaw=0x%04X", yawRaw, brakePressure, tempRaw);
+}
+
+
+void BuildABS_MUX2()
+{
+word steeringRaw; word longRaw; word latRaw;
+steeringRaw = (word)((steeringWheelAngle + 720.0) / 0.05);
+longRaw = (word)((longitudinalAcceleration + 25.0) / 0.05);
+latRaw = (word)((lateralAcceleration + 25.0) / 0.05);
+raw0 = (byte)(0x02 | ((latRaw & 0x0F) << 4));
+raw1 = (byte)(((latRaw >> 4) & 0x3F) | ((longRaw & 0x03) << 6));
+raw2 = (byte)((longRaw >> 2) & 0xFF);
+raw3 = (byte)(steeringRaw & 0xFF);
+raw4 = (byte)((steeringRaw >> 8) & 0xFF);
+raw5 = 0x00;
+write("DEBUG [ABS_ECU] [STEP 1] Raw Input Signals (0x110-0x2): LatRaw=0x%03X | LongRaw=0x%03X | SteeringRaw=0x%04X", latRaw, longRaw, steeringRaw);
+}
+
+
+/* ======================================================================== */
+/* Generate realistic live values                                           */
+/* ======================================================================== */
+
+void UpdateLiveABSValues()
+{
+frontWheelSpeed += (random(5) - 2) * 0.1;
+rearWheelSpeed += (random(5) - 2) * 0.1;
+brakeTemperature += (random(3) - 1) * 0.5;
+}
+
+/*======================================================================== /
+/ 7. TRANSMISSION TIMER OPERATIONS /
+/ ======================================================================== */
+
+on timer txAbsSensorTimer
+{
+byte computedMac;
+UpdateLiveABSValues();
+   if (muxSelector == 0)
+  {
+    BuildABS_MUX0();
+
+    write("");
+    write("============================================================");
+    write("[ABS_TX] CAN ID 0x110 - ABS_Sensor_Msg");
+    write("[ABS_TX] MUX SELECTOR = 0");
+    write("============================================================");
+  }
+  else if (muxSelector == 1)
+  {
+    BuildABS_MUX1();
+
+    write("");
+    write("============================================================");
+    write("[ABS_TX] CAN ID 0x110 - ABS_Sensor_Msg");
+    write("[ABS_TX] MUX SELECTOR = 1");
+    write("============================================================");
+  }
+  else
+  {
+    BuildABS_MUX2();
+
+    write("");
+    write("============================================================");
+    write("[ABS_TX] CAN ID 0x110 - ABS_Sensor_Msg");
+    write("[ABS_TX] MUX SELECTOR = 2");
+    write("============================================================");
+  }
+
+  /* ================================================================ */
+  /* STEP 1 - PLAINTEXT                                               */
+  /* ================================================================ */
+
+  write("[ABS_TX] STEP 1 - Plaintext");
+  write("[ABS_TX] [%02X %02X %02X %02X %02X %02X]",
+        raw0,
+        raw1,
+        raw2,
+        raw3,
+        raw4,
+        raw5);
+
+  /* ================================================================ */
+  /* STEP 2 - PADDED PLAINTEXT                                       */
+  /* ================================================================ */
+
+  EncryptSixBytes(raw0, raw1, raw2, raw3, raw4, raw5);
+
+  write("[ABS_TX] STEP 2 - PKCS7 Padded Plaintext");
+  write("[ABS_TX] [%02X %02X %02X %02X %02X %02X %02X %02X]",
+        pad0,
+        pad1,
+        pad2,
+        pad3,
+        pad4,
+        pad5,
+        pad6,
+        pad7);
+
+  /* ================================================================ */
+  /* STEP 3 - CIPHERTEXT                                             */
+  /* ================================================================ */
+  write("[ABS_TX] STEP 3 - ASCON Ciphertext");
+  write("[ABS_TX] [%02X %02X %02X %02X %02X %02X]",
+        cipher0,
+        cipher1,
+        cipher2,
+        cipher3,
+        cipher4,
+        cipher5);
+
+  /* ================================================================ */
+  /* STEP 4 - MAC                                                     */
+  /* ================================================================ */
+  computedMac =Generate_Verification_MAC(raw0,raw1,raw2,raw3,raw4,raw5);
+  write("[ABS_TX] STEP 4 - MAC");
+  write("[ABS_TX] MAC = 0x%02X",computedMac);
+
+  /* ================================================================ */
+  /* STEP 5 - COUNTER                                                  */
+  /* ================================================================ */
+  write("[ABS_TX] STEP 5 - Freshness Counter");
+  write("[ABS_TX] Counter = 0x%02X", txCounter110);
+
+  /* ================================================================ */
+  /* STEP 6 - FINAL CAN FRAME                                         */
+  /* ================================================================ */
+  txABSSensor.id = 0x110;
+  txABSSensor.dlc = 8;
+
+  txABSSensor.byte(0) = cipher0;
+  txABSSensor.byte(1) = cipher1;
+  txABSSensor.byte(2) = cipher2;
+  txABSSensor.byte(3) = cipher3;
+  txABSSensor.byte(4) = cipher4;
+  txABSSensor.byte(5) = cipher5;
+  txABSSensor.byte(6) = txCounter110;
+  txABSSensor.byte(7) = computedMac;
+
+  write("[ABS_TX] STEP 6 - Final CAN Frame");
+  write("[ABS_TX] CAN ID = 0x110");
+  write("[ABS_TX] DLC    = 8");
+
+  write("[ABS_TX] CAN DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+        txABSSensor.byte(0),
+        txABSSensor.byte(1),
+        txABSSensor.byte(2),
+        txABSSensor.byte(3),
+        txABSSensor.byte(4),
+        txABSSensor.byte(5),
+        txABSSensor.byte(6),
+        txABSSensor.byte(7));
+
+  /* ================================================================ */
+  /* TRANSMIT                                                         */
+  /* ================================================================ */
+
+  output(txABSSensor);
+
+  write("[ABS_TX] 0x110 TRANSMISSION COMPLETE");
+  write("------------------------------------------------------------");
+
+  /* ================================================================ */
+  /* UPDATE COUNTER + MUX                                             */
+  /* ================================================================ */
+
+  txCounter110++;
+
+  muxSelector++;
+
+  if (muxSelector > 2)
+    muxSelector = 0;
+
+  setTimer(txAbsSensorTimer, 25);
+}
+/* ======================================================================== // 
+0x120 ABS_Sensor_Error_msg - 8 byte layout with Encryption               //
+======================================================================== */
+on timer txAbsErrorTimer
+{
+byte computedMac;
+// Build 6 plaintext bytes matching database properties
+raw0 = absMilBlinkPattern;
+raw1 = (byte)(((word)(distanceFront / 0.25)) & 0xFF);
+raw2 = (byte)(((((word)(distanceFront / 0.25)) >> 8) & 0x0F) | ((((word)(distanceRear / 0.25)) & 0x0F) << 4));
+raw3 = (byte)((((word)(distanceRear / 0.25)) >> 4) & 0xFF);
+raw4 = (byte)(((frontWheelSpeedError & 0x01) << 0) | ((rearWheelSpeedError & 0x01) << 1));
+raw5 = 0x00;
+ 
+write("DEBUG [ABS_ECU] [STEP 1] Raw Input Signals (0x120): MilPattern=0x%02X | FrontErr=%d | RearErr=%d", raw0, (int)frontWheelSpeedError, (int)rearWheelSpeedError);
+EncryptSixBytes(raw0, raw1, raw2, raw3, raw4, raw5);
+computedMac = Generate_Verification_MAC(raw0, raw1, raw2, raw3, raw4, raw5);
+
+  txABSError.id = 0x120;
+txABSError.dlc = 8;
+txABSError.byte(0) = cipher0; txABSError.byte(1) = cipher1;
+txABSError.byte(2) = cipher2; txABSError.byte(3) = cipher3;
+txABSError.byte(4) = cipher4; txABSError.byte(5) = cipher5;
+txABSError.byte(6) = txCounter120;
+txABSError.byte(7) = computedMac;
+
+  write("DEBUG [ABS_ECU] [0x120 ERROR] Final CAN Payload Block: [%02X %02X %02X %02X %02X %02X %02X %02X]", txABSError.byte(0), txABSError.byte(1), txABSError.byte(2), txABSError.byte(3), txABSError.byte(4), txABSError.byte(5), txABSError.byte(6), txABSError.byte(7));
+output(txABSError);
+txCounter120++;
+setTimer(txAbsErrorTimer, 100);
+}
+
+/* Simulated Event Function for Error Message Generation */
+void SendABSErrorFrame()
+{
+byte computedMac;
+word distFrontRaw; word distRearRaw;
+distFrontRaw = (word)(distanceFront / 0.25);
+distRearRaw = (word)(distanceRear / 0.25);
+raw0 = absMilBlinkPattern;
+raw1 = (byte)(distFrontRaw & 0xFF);
+raw2 = (byte)(((distFrontRaw >> 8) & 0x0F) | ((distRearRaw & 0x0F) << 4));
+raw3 = (byte)((distRearRaw >> 4) & 0xFF);
+raw4 = (byte)(((frontWheelSpeedError & 0x01) << 0) | ((rearWheelSpeedError & 0x01) << 1));
+raw5 = 0x00;
+EncryptSixBytes(raw0, raw1, raw2, raw3, raw4, raw5);
+computedMac = Generate_Verification_MAC(raw0, raw1, raw2, raw3, raw4, raw5);
+txABSError.id = 0x120;
+txABSError.dlc = 8;
+txABSError.byte(0) = cipher0; txABSError.byte(1) = cipher1;
+txABSError.byte(2) = cipher2; txABSError.byte(3) = cipher3;
+txABSError.byte(4) = cipher4; txABSError.byte(5) = cipher5;
+txABSError.byte(6) = txCounter120;
+txABSError.byte(7) = computedMac;
+output(txABSError);
+txCounter120++;
+}
+
+/*======================================================================== /
+/ 5. RECEPTION (RX) & VERIFICATION MODULES /
+/ ======================================================================== */
+
+void VerifyABS_MUX(
+    byte b0, 
+    byte b1, 
+    byte b2, 
+    byte b3, 
+    byte b4, 
+    byte b5, 
+    byte b6, 
+    byte b7)
+{
+  byte selector;
+  byte calculated;
+  word value16;
+  word rawLatAccel;      
+  word rawLongAccel;     
+  word rawSteering;      
+  word signed12;
+  byte brakeStatus;
+  byte absActive;
+  byte slipRatio;
+
+   rxCounter = b6;
+  rxMac = b7;
+    if (b0 == 0x00 && b1 == 0x00 && b6 == 0x00) 
+    return;
+  
+  if (firstFrameABS == 1)
+  {
+    expectedCounter[1] = rxCounter;
+    firstFrameABS = 0;
+  }
+  
+  if (rxCounter != expectedCounter[1])
+  {
+    write("SECURITY [0x110] COUNTER MISMATCH | Expected 0x%02X | Received 0x%02X", expectedCounter[1], rxCounter);
+    return;
+  }
+
+  Secure_Decrypt(b0,b1,b2,b3,b4,b5);
+
+  calculated = Generate_Verification_MAC(
+    globalDecryptedBlock_0,
+    globalDecryptedBlock_1,
+    globalDecryptedBlock_2,
+    globalDecryptedBlock_3,
+    globalDecryptedBlock_4,
+    globalDecryptedBlock_5);
+
+  if (rxMac != calculated)
+  {
+    write("SECURITY [0x110] MAC MISMATCH | Expected 0x%02X | Received 0x%02X", calculated, rxMac);
+    return;
+  }
+
+  selector = globalDecryptedBlock_0 & 0x0F;
+
+  // --- RE-ORDERED SYSTEM OUTPUT BLOCK START ---
+  write("DEBUG [ABS_ECU_Tx]: =================================================================================");
+  
+  if (selector == 0)
+  {
+    slipRatio = globalDecryptedBlock_5;
+    brakeStatus = (globalDecryptedBlock_0 >> 5) & 0x03;
+    absActive = (globalDecryptedBlock_0 >> 4) & 0x01;
+    value16 = globalDecryptedBlock_1 | (globalDecryptedBlock_2 << 8);
+
+    write("DEBUG [ABS_Tx] [0x110] Raw Input Signals (0x110-0x0): Selector=0x0 | Active=0x%X | BrakeStatus=0x%X | FrontRaw=0x%04X | RearRaw=0x%04X | Slip=0x%02X", absActive, brakeStatus, value16, (globalDecryptedBlock_3 | (globalDecryptedBlock_4 << 8)), slipRatio);
+    write("DEBUG [ABS_Tx] [MUX0] FrontSpeed=%0.2f kmph | RearSpeed=%0.2f kmph | Slip=%d %% | Active=%d", value16 * 0.0078126, (globalDecryptedBlock_3 | (globalDecryptedBlock_4 << 8)) * 0.0078126, slipRatio, absActive);
+  }
+  else if (selector == 1)
+  {
+    signed12 = ((globalDecryptedBlock_0 >> 4) & 0x0F) | (globalDecryptedBlock_1 << 4);
+    value16 = globalDecryptedBlock_2;
+    write("DEBUG [ABS_Tx] [0x110] Raw Input Signals (0x110-0x1): Selector=0x1 | YawRateRaw=0x%03X | Pressure=0x%02X | TempRaw=0x%04X", signed12, value16, (globalDecryptedBlock_3 | (globalDecryptedBlock_4 << 8)));
+    write("DEBUG [ABS_Tx] [MUX1] YawRate=%0.2f deg/s | Pressure=%d Bar | Temp=%0.1f deg C", (signed12 * 0.05) - 100.0, value16, ((globalDecryptedBlock_3 | (globalDecryptedBlock_4 << 8)) * 0.1) - 40.0);
+  }
+  else if (selector == 2)
+  {
+    rawLatAccel  = (globalDecryptedBlock_0 >> 4) | ((globalDecryptedBlock_1 & 0x3F) << 4);
+    rawLongAccel = ((globalDecryptedBlock_1 >> 6) & 0x03) | (globalDecryptedBlock_2 << 2);
+    rawSteering  = globalDecryptedBlock_3 | (globalDecryptedBlock_4 << 8);
+
+    write("DEBUG [ABS_Tx] [0x110] Raw Input Signals (0x110-0x2): Selector=0x2 | LatAccelRaw=0x%03X | LongAccelRaw=0x%03X | SteeringRaw=0x%04X", rawLatAccel, rawLongAccel, rawSteering);
+    write("DEBUG [ABS_Tx] [MUX2] Steering=%0.1f deg | LongAccel=%0.2f m/s2 | LatAccel=%0.2f m/s2", (rawSteering * 0.05) - 720.0, (rawLongAccel * 0.05) - 25.0, (rawLatAccel * 0.05) - 25.0);
+  }
+
+  write("DEBUG [ABS_Tx] [STEP 1] Raw Input Signals: [%02X %02X %02X %02X %02X %02X]", globalDecryptedBlock_0, globalDecryptedBlock_1, globalDecryptedBlock_2, globalDecryptedBlock_3, globalDecryptedBlock_4, globalDecryptedBlock_5);
+  write("DEBUG [ABS_Tx] [STEP 2] After PKCS7 padding: [%02X %02X %02X %02X %02X %02X 02 02]", globalDecryptedBlock_0, globalDecryptedBlock_1, globalDecryptedBlock_2, globalDecryptedBlock_3, globalDecryptedBlock_4, globalDecryptedBlock_5);
+  write("DEBUG [ABS_Tx] [STEP 3] True ASCON truncated Signature MAC: 0x%02X", calculated);
+  write("DEBUG [ABS_Tx] [STEP 4] 0x110 Final CAN Payload Block: [%02X %02X %02X %02X %02X %02X %02X %02X]", b0, b1, b2, b3, b4, b5, b6, b7);
+
+  write("DEBUG [IC_RX]: [STEP 1] Received Encrypted Data from Tx: [%02X %02X %02X %02X %02X %02X %02X %02X]", b0,b1,b2,b3,b4,b5,b6,b7);
+  write("DEBUG [IC_RX]: [STEP 2] MAC MATCH SUCCESS | Selector = 0x%X", selector);
+  write("DEBUG [IC_RX]: [STEP 3] True ASCON truncated Signature MAC: 0x%02X", calculated);
+  write("DEBUG [IC_RX]: [STEP 4] Plaintext: [%02X %02X %02X %02X %02X %02X]", globalDecryptedBlock_0,globalDecryptedBlock_1,globalDecryptedBlock_2,globalDecryptedBlock_3,globalDecryptedBlock_4,globalDecryptedBlock_5);
+  write("DEBUG [IC_RX]: [O/P Status] SECURE MUX FRAME ACCEPTED");
+  write("DEBUG [IC_Rx]: =================================================================================");
+  // --- RE-ORDERED SYSTEM OUTPUT BLOCK END ---
+
+  expectedCounter[1] = expectedCounter[1] + 1;
+}
+
+void VerifyABS_Error8(
+    byte b0,
+    byte b1, 
+    byte b2, 
+    byte b3, 
+    byte b4, 
+    byte b5, 
+    byte b6, 
+    byte b7)
+{
+    byte calculated; 
+    byte idx;
+    word pattern;
+  
+idx = GetCounterIndex(0x120);
+    rxCounter = b6; 
+    rxMac = b7;
+  
+if (b0 == 0x00 && b1 == 0x00 && b6 == 0x00) 
+    return;
+if (firstFrame120 == 1) 
+  { 
+    expectedCounter[idx] = rxCounter; 
+    firstFrame120 = 0; 
+  }
+if (rxCounter != expectedCounter[idx])
+  return;
+Secure_Decrypt(b0, b1, b2, b3, b4, b5);
+calculated = Generate_Verification_MAC(globalDecryptedBlock_0, globalDecryptedBlock_1, globalDecryptedBlock_2, globalDecryptedBlock_3, globalDecryptedBlock_4, globalDecryptedBlock_5);
+if (rxMac != calculated) 
+  return;
+  write("");
+  write("============================================================");
+  write("[EMS_RX] CAN ID 0x120 - ABS_Sensor_Error_msg");
+  write("============================================================");
+
+ write("[ABS_TX] STEP 1 - Raw ABS Error Payload");
+write("[ABS_TX] Plaintext = [%02X %02X %02X %02X %02X %02X]",
+      raw0,raw1,raw2,raw3,raw4,raw5);
+
+write("[ABS_TX] STEP 2 - Padded Plaintext");
+write("[ABS_TX] Padded = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+      pad0,pad1,pad2,pad3,pad4,pad5,pad6,pad7);
+
+write("[ABS_TX] STEP 3 - Ciphertext");
+write("[ABS_TX] Ciphertext = [%02X %02X %02X %02X %02X %02X]",
+      cipher0,cipher1,cipher2,cipher3,cipher4,cipher5);
+
+write("[ABS_TX] STEP 4 - Counter");
+write("[ABS_TX] Counter = 0x%02X",
+      txCounter120);
+
+write("[ABS_TX] STEP 5 - MAC");
+write("[ABS_TX] MAC = 0x%02X",calculated);
+
+write("[ABS_TX] STEP 6 - Final CAN Frame");
+write("[ABS_TX] ID = 0x120");
+write("[ABS_TX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+      txABSError.byte(0),
+      txABSError.byte(1),
+      txABSError.byte(2),
+      txABSError.byte(3),
+      txABSError.byte(4),
+      txABSError.byte(5),
+      txABSError.byte(6),
+      txABSError.byte(7));
+
+output(txABSError);
+
+write("[ABS_TX] STATUS = 0x120 FRAME TRANSMITTED");
+write("============================================================");
+  expectedCounter[idx]++;
+}
+
+/* ======================================================================== /
+/ 8. RECEPTION (RX) & VERIFICATION MODULES /
+/ ======================================================================== */
+void VerifyClusterIndication(byte b0,byte b1, byte b2, byte b3,byte b4, byte b5, byte b6, byte b7)
+{
+  byte calculatedMac;
+
+  write("");
+  write("================================================");
+  write("[ABS_RX] CAN ID 0x130 - Cluster_Indication");
+  write("================================================");
+  write("[ABS_RX] STEP 1 - Received CAN Frame");
+  write("[ABS_RX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+        b0,b1,b2,b3,b4,b5,b6,b7);
+
+  /* Counter */
+  write("[ABS_RX] STEP 2 - Counter Verification");
+  write("[ABS_RX] Received Counter = 0x%02X", b6);
+
+  if (b6 != expectedCounter[3])
+  {
+    write("[ABS_RX] COUNTER = INVALID");
+    write("[ABS_RX] FRAME = REJECTED");
+    return;
+  }
+  write("[ABS_RX] COUNTER = VALID");
+
+  /* Decryption */
+  Secure_Decrypt(b0,b1,b2,b3,b4,b5);
+
+  write("[ABS_RX] STEP 3 - Decrypted Data");
+  write("[ABS_RX] DATA = [%02X %02X %02X %02X %02X %02X]",globalDecryptedBlock_0,globalDecryptedBlock_1,globalDecryptedBlock_2,globalDecryptedBlock_3,globalDecryptedBlock_4,globalDecryptedBlock_5);
+
+  /* MAC */
+  calculatedMac = Generate_Verification_MAC(globalDecryptedBlock_0,globalDecryptedBlock_1,globalDecryptedBlock_2,globalDecryptedBlock_3,globalDecryptedBlock_4,globalDecryptedBlock_5);
+
+  write("[ABS_RX] STEP 4 - MAC Verification");
+  write("[ABS_RX] Received MAC   = 0x%02X", b7);
+  write("[ABS_RX] Calculated MAC = 0x%02X", calculatedMac);
+
+  if (b7 != calculatedMac)
+  {
+    write("[ABS_RX] MAC = INVALID");
+    write("[ABS_RX] FRAME = REJECTED");
+    return;
+  }
+
+  write("[ABS_RX] MAC = VALID");
+
+  /* Decode */
+  write("[ABS_RX] STEP 5 - Recovered Cluster Data");
+  write("[ABS_RX] ABS Ride Mode     = %d",globalDecryptedBlock_0);
+  write("[ABS_RX] EMS Ride Mode     = %d",globalDecryptedBlock_1);
+  write("[ABS_RX] Vehicle Ride Mode = %d",globalDecryptedBlock_2);
+  write("[ABS_RX] Reserved = [%02X %02X %02X]",globalDecryptedBlock_3,globalDecryptedBlock_4,globalDecryptedBlock_5);
+
+  expectedCounter[3]++;
+
+  write("[ABS_RX] STEP 6 - 0x130 FRAME ACCEPTED");
+  write("================================================");
+}
+
+// Add this new timer function block anywhere outside other functions
+on timer tmr_ABSFaultInjector
+{
+  byte previousFaultState;
+  previousFaultState = g_AbsActiveFaultState;
+  
+  // Roll a random 0-99 value. Inject an anomaly if the value falls under 8 (8% chance every 400ms)
+  if (random(100) < 8)
+  {
+    g_AbsActiveFaultState = 1;
+    // Load simulation variables with component verification error indicators
+    absMilBlinkPattern = 0x04;    // Set dynamic blinking indicator
+    frontWheelSpeedError = 1;      // Force signal error state flag
+    rearWheelSpeedError = 1;
+    distanceFront = 142.5;         // Cache snapshot error conditions
+    distanceRear = 141.2;
+  }
+  else
+  {
+    g_AbsActiveFaultState = 0;
+    absMilBlinkPattern = 0x00;
+    frontWheelSpeedError = 0;
+    rearWheelSpeedError = 0;
+  }
+  
+  // Transmit the 8-byte frame ONLY when the system encounters a state transition
+  if (g_AbsActiveFaultState != previousFaultState)
+  {
+    // Triggers execution directly using your structural layout configuration rules
+    SendABSErrorFrame(); 
+    write("SECURITY [ABS_Tx] [EVENT INJECTED] 0x120 Status Changed! ActiveFault=%d", g_AbsActiveFaultState);
+  }
+  // Rearm the monitoring interval loop
+  setTimer(tmr_ABSFaultInjector, c_ABSFaultCheckInterval);
+}
+
+void HandleABS_Diagnostic(
+  byte b0,
+  byte b1,
+  byte b2,
+  byte b3,
+  byte b4,
+  byte b5,
+  byte b6,
+  byte b7)
+{
+  write("");
+  write("============================================================");
+  write("[ABS_RX] CAN ID 0x7E1 - Diagnostic Request");
+  write("[ABS_RX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+        b0,b1,b2,b3,b4,b5,b6,b7);
+
+  write("[ABS_RX] Diagnostic Request Received");
+
+  txABS_DiagResp.id = 0x7E9;
+  txABS_DiagResp.dlc = 8;
+
+  txABS_DiagResp.byte(0) = 0x50;
+  txABS_DiagResp.byte(1) = b1;
+  txABS_DiagResp.byte(2) = 0x00;
+  txABS_DiagResp.byte(3) = 0x00;
+  txABS_DiagResp.byte(4) = 0x00;
+  txABS_DiagResp.byte(5) = 0x00;
+  txABS_DiagResp.byte(6) = 0x00;
+  txABS_DiagResp.byte(7) = 0x00;
+
+  write("[ABS_TX] CAN ID 0x7E9 - Diagnostic Response");
+  write("[ABS_TX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+        txABS_DiagResp.byte(0),
+        txABS_DiagResp.byte(1),
+        txABS_DiagResp.byte(2),
+        txABS_DiagResp.byte(3),
+        txABS_DiagResp.byte(4),
+        txABS_DiagResp.byte(5),
+        txABS_DiagResp.byte(6),
+        txABS_DiagResp.byte(7));
+
+  output(txABS_DiagResp);
+
+  write("[ABS_TX] 0x7E9 DIAGNOSTIC RESPONSE TRANSMITTED");
+  write("============================================================");
+}
+
+on message *
+{
+  dword id;
+  id = this.id;
+  if (this.dlc != 8) return;
+
+  // FIX: Prevent processing self-transmitted frames
+  // If the message originated from this simulation node, ignore it
+  if (this.dir == tx)
+    return;
+
+  switch (id)
+  {
+    case 0x130:  
+      if (this.dlc == 8)
+      VerifyClusterIndication(this.byte(0), this.byte(1), this.byte(2), this.byte(3), this.byte(4), this.byte(5), this.byte(6), this.byte(7));
+      break;
+
+    case 0x120:
+      if (this.dlc == 8) 
+        VerifyABS_Error8(this.byte(0), this.byte(1), this.byte(2), this.byte(3), this.byte(4), this.byte(5), this.byte(6), this.byte(7));
+      break;
+    
+    case 0x7E1:
+      if (this.dlc >= 2)
+        HandleABS_Diagnostic(this.byte(0),this.byte(1),this.byte(2),this.byte(3),this.byte(4),this.byte(5),this.byte(6),this.byte(7));
+      break;
+    
+      default: 
+    break;
+  }
+}

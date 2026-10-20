@@ -1,0 +1,1234 @@
+﻿/*@!Encoding:65001*/
+/*
+ * IC_MUX_updated.can
+ *
+ * Secure CAN receiver for the FINAL DBC:
+ *   - 0x100 EMS_Data_Msg       : multiplexed, DLC 8
+ *   - 0x110 ABS_Sensor_Msg     : multiplexed, DLC 8
+ *   - Other secure messages    : normal 6-byte payload + Counter + MAC
+ *   - 0x101 EMS_Error_Msg      : DLC 4, Counter=byte2, MAC=byte3
+ *   - Diagnostic / non-secure messages are monitored but not decrypted.
+ *
+ * IMPORTANT:
+ * The encryption/MAC operation is kept compatible with the working
+ * EMS(1).can / Instrument_Cluster.can ASCON implementation supplied.
+ *
+ * This version fixes the previous compiler error by NEVER using `this`
+ * inside a normal function. `this.byte()` is used only in `on message *`,
+ * where it is legal, and the bytes are passed as function arguments.
+ */
+ 
+variables
+{
+  // --- Secure Engine Freshness & Cryptography States ---
+  byte rxCounter;           // Stores the counter extracted from the incoming frame (Byte 6)
+  byte rxMac;               // Stores the truncated MAC signature extracted from the incoming frame (Byte 7)
+  byte calculatedMac;       // Used to hold the locally computed MAC for validation checks
+  byte expectedCounter[32]; // Tracking array to manage unique sequential freshness values for every channel
+  
+  byte globalCiphertext_0; byte globalCiphertext_1;byte globalCiphertext_2;byte globalCiphertext_3;byte globalCiphertext_4;byte globalCiphertext_5;
+  
+  // Intermediate array to store decrypted application bytes before parsing
+  byte globalDecryptedBlock_0;byte globalDecryptedBlock_1;byte globalDecryptedBlock_2;byte globalDecryptedBlock_3;byte globalDecryptedBlock_4; byte globalDecryptedBlock_5;byte globalDecryptedBlock_6;byte globalDecryptedBlock_7;
+  
+  // --- ASCON State Registers (320-bit internal state divided into 5 pairs of 32-bit registers) ---
+  dword x0_h;dword x0_l;
+  dword x1_h;dword x1_l;
+  dword x2_h;dword x2_l;
+  dword x3_h;dword x3_l;
+  dword x4_h;dword x4_l;
+  
+  // --- Network Synchronization Tracking Flags ---
+  byte firstFrameEMS = 1;   // Automatically learns the sender's start counter value on first contact
+  byte firstFrameABS = 1;
+  byte firstFrame100 = 1; // FIX: Synchronizes counter tracking state on network init
+  byte firstFrame110 = 1;
+  byte firstFrame120 = 1;
+  byte firstFrame300 = 1;
+  byte firstFrame310 = 1; 
+  byte firstFrame320 = 1;
+  
+  // --- Node Transmission Objects & Timers ---
+  msTimer txClusterTimer;   // Timer variable driving the cyclic transmission rate
+  byte txCounter304 = 0;        // Outgoing Freshness Counter for Cluster_indication (0x130 / Dec 304)
+  
+  msTimer txRandomErrorTimer; 
+  int errorToggle = 0;
+  
+  // Local Application Mock Signals for Transmission Simulation
+  byte simAbsRideMode = 0;
+  byte simEmsRideMode = 1;
+  byte simVehicleRideMode = 2;
+  
+  message 0x350 txLightingWake;
+  message 0x351 txKeylessWake;
+  message 0x7EA txIC_DiagResp;
+  msTimer txWakeTimer;
+  byte wakeToggle = 0;
+  
+  // --- Intermediate Buffers for Padding & Crypto Operations ---
+  byte pad0; byte pad1;byte pad2; byte pad3; byte pad4; byte pad5; byte pad6; byte pad7;
+  byte cipher0; byte cipher1; byte cipher2; byte cipher3; byte cipher4; byte cipher5;
+}
+
+on preStart
+{
+  int i;
+  // Initialize freshness counters for all tracking channels to baseline zero before bus activity
+  for(i = 0; i < 32; i++) 
+  {
+    expectedCounter[i] = 0x00;
+  }
+}
+
+on start
+{
+  // Reset synchronization indicators on simulation start
+  firstFrame100 = 1;
+  firstFrame110 = 1;
+  firstFrame120 = 1;
+  firstFrame300 = 1;
+  firstFrame310 = 1;
+  firstFrame320 = 1;
+
+  write("============================================================");
+  write("IC_Mux RECEIVER SECURITY ENGINE INITIALIZED");
+  write("0x100 EMS verification loop with First-Frame Sync Active");
+  write("============================================================");
+  setTimer(txClusterTimer, 100);
+  setTimer(txWakeTimer, 150);
+  
+  // FIX: You must add this line to kickstart the randomized error generation loop!
+  setTimer(txRandomErrorTimer, 50); 
+}
+
+/* ------------------------------------------------------------------------- */
+/* ASCON permutation - same implementation as the working CAPL            */
+/* ------------------------------------------------------------------------- */
+dword RotateRight_H(dword h, dword l, int n)
+{
+  if (n < 32) return (h >> n) | (l << (32 - n));
+  return (l >> (n - 32)) | (h << (64 - n));
+}
+dword RotateRight_L(dword h, dword l, int n)
+{
+  if (n < 32) return (l >> n) | (h << (32 - n));
+  return (h >> (n - 32)) | (l << (64 - n));
+}
+void Ascon_Initialize_State()
+{
+  // Setup 320-bit internal initialization vector state using hardcoded keys
+  x0_h = 0x80400c06; x0_l = 0x00000000;
+  x1_h = 0x01020304; x1_l = 0x05060708;
+  x2_h = 0x090A0B0C; x2_l = 0x0D0E0F10;
+  x3_h = 0x00000000; x3_l = 0x00000000;
+  x4_h = 0x00000000; x4_l = 0x00000000;
+
+  Ascon_Permute_6();
+}
+void Ascon_Permute_6()
+{
+  int r;
+  dword t0_h; dword t0_l; dword t1_h; dword t1_l; dword t2_h; dword t2_l;
+  dword t3_h; dword t3_l; dword t4_h; dword t4_l;
+  byte current_rc;
+  for (r = 0; r < 6; r++)
+  {
+    switch (r)
+    {
+      case 0: current_rc = 0x9A; break;
+      case 1: current_rc = 0x8B; break;
+      case 2: current_rc = 0x7C; break;
+      case 3: current_rc = 0x6D; break;
+      case 4: current_rc = 0x5E; break;
+      case 5: current_rc = 0x4F; break;
+      default: current_rc = 0x00; break;
+    }
+    x2_l = x2_l ^ current_rc;
+    x0_h = x0_h ^ x4_h; x0_l = x0_l ^ x4_l;
+    x4_h = x4_h ^ x3_h; x4_l = x4_l ^ x3_l;
+    x2_h = x2_h ^ x1_h; x2_l = x2_l ^ x1_l;
+    t0_h = ~x0_h; t0_l = ~x0_l;
+    t1_h = ~x1_h; t1_l = ~x1_l;
+    t2_h = ~x2_h; t2_l = ~x2_l;
+    t3_h = ~x3_h; t3_l = ~x3_l;
+    t4_h = ~x4_h; t4_l = ~x4_l;
+    x0_h = x0_h ^ (t1_h & x2_h); x0_l = x0_l ^ (t1_l & x2_l);
+    x1_h = x1_h ^ (t2_h & x3_h); x1_l = x1_l ^ (t2_l & x3_l);
+    x2_h = x2_h ^ (t3_h & x4_h); x2_l = x2_l ^ (t3_l & x4_l);
+    x3_h = x3_h ^ (t4_h & t0_h); x3_l = x3_l ^ (t4_l & t0_l);
+    x4_h = x4_h ^ (t0_h & x1_h); x4_l = x4_l ^ (t0_l & x1_l);
+    x1_h = x1_h ^ x0_h; x1_l = x1_l ^ x0_l;
+    x0_h = x0_h ^ x4_h; x0_l = x0_l ^ x4_l;
+    x3_h = x3_h ^ x2_h; x3_l = x3_l ^ x2_l;
+    x2_h = ~x2_h;       x2_l = ~x2_l;
+    t0_h = x0_h; t0_l = x0_l;
+    x0_h = x0_h ^ RotateRight_H(t0_h, t0_l, 19) ^ RotateRight_H(t0_h, t0_l, 28);
+    x0_l = x0_l ^ RotateRight_L(t0_h, t0_l, 19) ^ RotateRight_L(t0_h, t0_l, 28);
+    t1_h = x1_h; t1_l = x1_l;
+    x1_h = x1_h ^ RotateRight_H(t1_h, t1_l, 61) ^ RotateRight_H(t1_h, t1_l, 39);
+    x1_l = x1_l ^ RotateRight_L(t1_h, t1_l, 61) ^ RotateRight_L(t1_h, t1_l, 39);
+    t2_h = x2_h; t2_l = x2_l;
+    x2_h = x2_h ^ RotateRight_H(t2_h, t2_l, 1)  ^ RotateRight_H(t2_h, t2_l, 6);
+    x2_l = x2_l ^ RotateRight_L(t2_h, t2_l, 1)  ^ RotateRight_L(t2_h, t2_l, 6);
+    t3_h = x3_h; t3_l = x3_l;
+    x3_h = x3_h ^ RotateRight_H(t3_h, t3_l, 10) ^ RotateRight_H(t3_h, t3_l, 17);
+    x3_l = x3_l ^ RotateRight_L(t3_h, t3_l, 10) ^ RotateRight_L(t3_h, t3_l, 17);
+    t4_h = x4_h; t4_l = x4_l;
+    x4_h = x4_h ^ RotateRight_H(t4_h, t4_l, 7)  ^ RotateRight_H(t4_h, t4_l, 41);
+    x4_l = x4_l ^ RotateRight_L(t4_h, t4_l, 7)  ^ RotateRight_L(t4_h, t4_l, 41);
+  }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Decrypt six encrypted application bytes.                                */
+/* Bytes 6 and 7 are Counter and MAC and are not encrypted.                */
+/* ------------------------------------------------------------------------- */
+void Secure_Decrypt(byte c0, byte c1, byte c2, byte c3, byte c4, byte c5)
+{
+  dword cipher_h; dword cipher_l;
+  dword recovered_msg_h; dword recovered_msg_l;
+  byte pad6; byte pad7;
+  
+  Ascon_Initialize_State();
+  cipher_h = (c0 << 24) | (c1 << 16) | (c2 << 8) | c3;
+  pad6 = 0x02 ^ (byte)((x0_l >> 8) & 0xFF);
+  pad7 = 0x02 ^ (byte)(x0_l & 0xFF);
+  cipher_l = (c4 << 24) | (c5 << 16) | (pad6 << 8) | pad7;
+  
+  recovered_msg_h = cipher_h ^ x0_h;
+  recovered_msg_l = cipher_l ^ x0_l;
+  
+  globalDecryptedBlock_0 = (byte)((recovered_msg_h >> 24) & 0xFF);
+  globalDecryptedBlock_1 = (byte)((recovered_msg_h >> 16) & 0xFF);
+  globalDecryptedBlock_2 = (byte)((recovered_msg_h >> 8)  & 0xFF);
+  globalDecryptedBlock_3 = (byte)(recovered_msg_h & 0xFF);
+  globalDecryptedBlock_4 = (byte)((recovered_msg_l >> 24) & 0xFF);
+  globalDecryptedBlock_5 = (byte)((recovered_msg_l >> 16) & 0xFF);
+  globalDecryptedBlock_6 = (byte)((recovered_msg_l >> 8)  & 0xFF);
+  globalDecryptedBlock_7 = (byte)(recovered_msg_l & 0xFF);
+  x0_h = cipher_h;x0_l = cipher_l;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Generate MAC exactly as the working sender/receiver state operation.     */
+/* ------------------------------------------------------------------------- */
+byte Generate_Verification_MAC(byte p0,byte p1, byte p2, byte p3, byte p4, byte p5)
+{
+  dword msg_h; dword msg_l;
+  
+  msg_h = (p0 << 24) | (p1 << 16) | (p2 << 8)  | p3;
+  msg_l = (p4 << 24) | (p5 << 16) | (0x02 << 8) | 0x02;
+  
+  Ascon_Initialize_State();
+  x0_h = x0_h ^ msg_h;
+  x0_l = x0_l ^ msg_l;
+  
+  Ascon_Permute_6();
+  return (byte)(x3_l & 0xFF);
+}
+
+/* ======================================================================== */
+/* Encryption Core Logic for Outgoing 0x130 Frame                           */
+/* ======================================================================== */
+void EncryptSixBytes(byte r0, byte r1, byte r2, byte r3, byte r4, byte r5)
+{
+  dword msg_h; dword msg_l;
+  pad0 = r0; pad1 = r1; pad2 = r2; pad3 = r3; pad4 = r4; pad5 = r5;pad6 = 0x02; pad7 = 0x02; 
+  // Appends PKCS#7 standard bytes to pad out the 6-byte data block
+  
+  Ascon_Initialize_State();
+  msg_h = ((dword)pad0 << 24) | ((dword)pad1 << 16) | ((dword)pad2 << 8) | (dword)pad3;
+  msg_l = ((dword)pad4 << 24) | ((dword)pad5 << 16) | ((dword)pad6 << 8) | (dword)pad7;
+  
+  x0_h = x0_h ^ msg_h; 
+  x0_l = x0_l ^ msg_l;
+  
+  cipher0 = (byte)((x0_h >> 24) & 0xFF); 
+  cipher1 = (byte)((x0_h >> 16) & 0xFF);
+  cipher2 = (byte)((x0_h >> 8)  & 0xFF); 
+  cipher3 = (byte)(x0_h & 0xFF);
+  cipher4 = (byte)((x0_l >> 24) & 0xFF); 
+  cipher5 = (byte)((x0_l >> 16) & 0xFF);
+}
+
+byte Generate_Local_MAC()
+{
+  Ascon_Permute_6();
+  return (byte)(x3_l & 0xFF);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Counter table Lookup                                                      */
+/* ------------------------------------------------------------------------- */
+byte GetCounterIndex(dword id)
+{
+  switch (id)
+  {
+    case 0x100: return 0;
+    case 0x110: return 1;
+    case 0x120: return 2; // ABS_Sensor_Error_msg (0x120 / Dec 288)
+    case 0x130: return 3; // Cluster_indication (0x130 / Dec 304)
+    case 0x300: return 4;
+    case 0x310: return 5;
+    case 0x320: return 6;
+    case 0x350: return 7;
+    case 0x351: return 8;
+    case 0x101: return 9; // EMS_Error_Msg (0x101 / Dec 257)
+    default:    return 31;
+  }
+}
+
+  /* ============================================================ */
+  /* 0x130 CLUSTER INDICATION - TX                                */
+  /* ============================================================ */
+ on timer txClusterTimer
+{
+  message 0x130 clMsg; 
+  byte computedMac;
+  
+  write("");
+  write("============================================================");
+  write("[IC_TX] CAN ID 0x130 - Cluster_Indication");
+  write("============================================================");
+ 
+  /* ------------------------------------------------------------ */
+  /* STEP 1 - INPUT VALUES                                       */
+  /* ------------------------------------------------------------ */
+  write("[IC_TX] STEP 1 - Cluster Input Values");
+  write("[IC_TX] ABS Ride Mode     = %d",simAbsRideMode);
+  write("[IC_TX] EMS Ride Mode     = %d",simEmsRideMode);
+  write("[IC_TX] Vehicle Ride Mode = %d",simVehicleRideMode);
+  write("[IC_TX] Reserved Data     = [00 00 00]");
+  
+  /* ------------------------------------------------------------ */
+  /* STEP 2 - PLAINTEXT                                          */
+  /* ------------------------------------------------------------ */
+  write("[IC_TX] STEP 2 - Plaintext");
+  write("[IC_TX] DATA = [%02X %02X %02X %02X %02X %02X]",simAbsRideMode,simEmsRideMode,simVehicleRideMode,0x00,0x00,0x00);
+  
+  /* ------------------------------------------------------------ */
+  /* STEP 3 - ENCRYPTION                                         */
+  /* ------------------------------------------------------------ */
+  EncryptSixBytes(simAbsRideMode, simEmsRideMode, simVehicleRideMode, 0x00, 0x00, 0x00);
+
+  write("[IC_TX] STEP 3 - Padded Plaintext");
+  write("[IC_TX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",pad0,pad1,pad2,pad3,pad4,pad5,pad6,pad7);
+  write("[IC_TX] Ciphertext = [%02X %02X %02X %02X %02X %02X]",cipher0,cipher1,cipher2,cipher3,cipher4,cipher5);
+
+  /* ------------------------------------------------------------ */
+  /* STEP 4 - COUNTER                                             */
+  /* ------------------------------------------------------------ */
+  write("[IC_TX] STEP 4 - Freshness Counter = 0x%02X",txCounter304);
+  
+  /* ------------------------------------------------------------ */
+  /* STEP 5 - MAC                                                 */
+  /* ------------------------------------------------------------ */
+  computedMac = Generate_Local_MAC();
+  write("[IC_TX] STEP 5 - MAC = 0x%02X",computedMac);
+  
+  /* ------------------------------------------------------------ */
+  /* STEP 6 - FINAL CAN FRAME                                     */
+  /* ------------------------------------------------------------ */
+  clMsg.dlc = 8;
+  clMsg.byte(0) = cipher0;
+  clMsg.byte(1) = cipher1; 
+  clMsg.byte(2) = cipher2;
+  clMsg.byte(3) = cipher3; 
+  clMsg.byte(4) = cipher4; 
+  clMsg.byte(5) = cipher5;
+  clMsg.byte(6) = txCounter304; // Append freshness value to byte 6
+  clMsg.byte(7) = computedMac;  // Append ASCON signature tag to byte 7
+  
+  write("[IC_TX] STEP 6 - Final CAN Frame");
+  write("[IC_TX] ID  = 0x130");
+  write("[IC_TX] DLC = 8");
+  write("[IC_TX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",clMsg.byte(0),clMsg.byte(1),clMsg.byte(2),clMsg.byte(3),clMsg.byte(4),clMsg.byte(5),clMsg.byte(6),clMsg.byte(7));
+  
+  output(clMsg); // Broadcast onto network bus
+  write("[IC_TX] 0x130 TRANSMISSION COMPLETE");
+  write("============================================================");
+  write("");
+  
+  txCounter304++; 
+  setTimer(txClusterTimer, 100); // Reschedule the 100ms cycle interval timer
+}
+
+on timer txWakeTimer
+{
+  long randomInterval; // Variable to store the generated random time
+  if (wakeToggle == 0)
+  {
+    txLightingWake.id = 0x350;
+    txLightingWake.dlc = 8;
+
+    txLightingWake.byte(0) = 0x01;   // Wake request
+    txLightingWake.byte(1) = 0x01;   // Lighting ECU target
+    txLightingWake.byte(2) = 0x00;
+    txLightingWake.byte(3) = 0x00;
+    txLightingWake.byte(4) = 0x00;
+    txLightingWake.byte(5) = 0x00;
+    txLightingWake.byte(6) = 0x00;
+    txLightingWake.byte(7) = 0x00;
+
+    write("");
+    write("[IC_TX] ================================================");
+    write("[IC_TX] CAN ID 0x350 - Lighting ECU Wake");
+    write("[IC_TX] Wake Request = ACTIVE");
+    write("[IC_TX] Target ECU   = LIGHTING");
+    write("[IC_TX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",txLightingWake.byte(0),txLightingWake.byte(1),txLightingWake.byte(2),txLightingWake.byte(3),txLightingWake.byte(4), txLightingWake.byte(5),txLightingWake.byte(6),txLightingWake.byte(7));
+
+    output(txLightingWake);
+    write("[IC_TX] 0x350 WAKE FRAME TRANSMITTED");
+  }
+  else
+  {
+    txKeylessWake.id = 0x351;
+    txKeylessWake.dlc = 8;
+
+    txKeylessWake.byte(0) = 0x01;
+    txKeylessWake.byte(1) = 0x02;
+    txKeylessWake.byte(2) = 0x00;
+    txKeylessWake.byte(3) = 0x00;
+    txKeylessWake.byte(4) = 0x00;
+    txKeylessWake.byte(5) = 0x00;
+    txKeylessWake.byte(6) = 0x00;
+    txKeylessWake.byte(7) = 0x00;
+
+    write("");
+    write("[IC_TX] ================================================");
+    write("[IC_TX] CAN ID 0x351 - Keyless ECU Wake");
+    write("[IC_TX] Wake Request = ACTIVE");
+    write("[IC_TX] Target ECU   = KEYLESS");
+    write("[IC_TX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",txKeylessWake.byte(0), txKeylessWake.byte(1),txKeylessWake.byte(2),txKeylessWake.byte(3),txKeylessWake.byte(4),txKeylessWake.byte(5),txKeylessWake.byte(6),txKeylessWake.byte(7));
+
+    output(txKeylessWake);
+    write("[IC_TX] 0x351 WAKE FRAME TRANSMITTED");
+  }
+  wakeToggle = 1 - wakeToggle;
+  randomInterval = 10 + random(41); 
+  setTimer(txWakeTimer, randomInterval);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Randomized Error Generation and Fault Injection Timer Loop               */
+/* ------------------------------------------------------------------------- */
+on timer txRandomErrorTimer
+{
+  long randomInterval;
+  int faultSelector;
+  message 0x101 emsErrorMsg;
+  message 0x130 clMsgWithFault;
+  byte faultyMac;
+
+  // Roll a random number between 0 and 2 to choose the action path
+  faultSelector = random(3);
+
+  if (faultSelector == 0)
+  {
+    // PATH 1: Transmit a standard application Error Msg (0x101) with valid structure
+    emsErrorMsg.dlc = 4;
+    emsErrorMsg.byte(0) = 0xA5; // Random error code bit pattern (e.g., sensor fault)
+    emsErrorMsg.byte(1) = 0x01; // Status active
+    emsErrorMsg.byte(2) = expectedCounter[9]; // Valid tracking counter for 0x101
+    
+    // Explicitly compute a valid MAC for this payload
+    emsErrorMsg.byte(3) = Generate_Verification_MAC(0xA5, 0x01, 0x00, 0x00, 0x00, 0x00);
+    
+    output(emsErrorMsg);
+    write("[IC_ERR_GEN] Transmitted valid EMS Error Frame 0x101 to simulate state changes");
+  }
+  else if (faultSelector == 1)
+  {
+    // PATH 2: Inject a deliberate FRESHNESS COUNTER ERROR into your standard 0x130 stream
+    EncryptSixBytes(simAbsRideMode, simEmsRideMode, simVehicleRideMode, 0x00, 0x00, 0x00);
+    clMsgWithFault.dlc = 8;
+    clMsgWithFault.byte(0) = cipher0;
+    clMsgWithFault.byte(1) = cipher1;
+    clMsgWithFault.byte(2) = cipher2;
+    clMsgWithFault.byte(3) = cipher3;
+    clMsgWithFault.byte(4) = cipher4;
+    clMsgWithFault.byte(5) = cipher5;
+    
+    // Inject a stale counter (subtracting a random offset) to trigger receiver rejection
+    clMsgWithFault.byte(6) = txCounter304 - (1 + random(5)); 
+    clMsgWithFault.byte(7) = Generate_Local_MAC();
+    
+    output(clMsgWithFault);
+    write("[IC_ERR_GEN] Injected deliberate STALE COUNTER FAULT into ID 0x130");
+  }
+  else
+  {
+    // PATH 3: Inject a deliberate MAC SIGNATURE FAULT into your standard 0x130 stream
+    EncryptSixBytes(simAbsRideMode, simEmsRideMode, simVehicleRideMode, 0x00, 0x00, 0x00);
+    clMsgWithFault.dlc = 8;
+    clMsgWithFault.byte(0) = cipher0;
+    clMsgWithFault.byte(1) = cipher1;
+    clMsgWithFault.byte(2) = cipher2;
+    clMsgWithFault.byte(3) = cipher3;
+    clMsgWithFault.byte(4) = cipher4;
+    clMsgWithFault.byte(5) = cipher5;
+    clMsgWithFault.byte(6) = txCounter304;
+    
+    // Corrupt the signature by XORing it with a bad bitmask
+    faultyMac = Generate_Local_MAC() ^ 0x55; 
+    clMsgWithFault.byte(7) = faultyMac;
+    
+    output(clMsgWithFault);
+    write("[IC_ERR_GEN] Injected deliberate CORRUPTED MAC FAULT into ID 0x130");
+  }
+
+  // Calculate a highly rapid random interval between 15ms and 60ms to force high network load
+  randomInterval = 15 + random(46); 
+  setTimer(txRandomErrorTimer, randomInterval);
+}
+
+/* ------------------------------------------------------------------------- */
+/* EMS 0x100 MUX receiver Block                                              */
+/* ------------------------------------------------------------------------- */
+void VerifyEMS_MUX(byte b0,byte b1,byte b2, byte b3, byte b4, byte b5, byte b6, byte b7)
+{
+  byte selector; 
+  byte calculated; 
+  
+  word value16; 
+  byte gear; 
+  byte engineLoad; 
+  byte batteryRaw; 
+  byte fuel; 
+  byte ignitionRaw; 
+  word oilPressure; 
+  byte engineStatus; 
+  byte maf; 
+  word vehicleSpeed; 
+  byte mapValue;
+  
+  /* ======================================================================= */
+  /* STEP 1 - RECEIVE CAN FRAME                                              */
+  /* ======================================================================= */
+  rxCounter = b6;rxMac = b7;
+  
+  write("");
+  write("============================================================");
+  write("[IC_RX] CAN ID 0x100 - EMS_Data_Msg");
+  write("============================================================");
+  write("[IC_RX] STEP 1 - Received CAN Frame");
+  write("[IC_RX] ID   = 0x100");
+  write("[IC_RX] DLC  = 8");
+  write("[IC_RX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",b0,b1,b2,b3,b4,b5,b6,b7);
+  
+  /* ======================================================================= */
+  /* STEP 2 - COUNTER CHECK                                                  */
+  /* ======================================================================= */
+  write("[IC_RX] STEP 2 - Counter Verification");
+  write("[IC_RX] Expected Counter = 0x%02X", expectedCounter[0]);
+  write("[IC_RX] Received Counter = 0x%02X", rxCounter);
+  
+  if (rxCounter != expectedCounter[0])
+  {
+    write("[IC_RX] COUNTER STATUS = INVALID");
+    write("[IC_RX] FRAME STATUS   = REJECTED");
+    write("============================================================");
+    return;
+  }
+  write("[IC_RX] COUNTER STATUS = VALID");
+  
+  /* ======================================================================= */
+  /* STEP 3 - DECRYPT                                                        */
+  /* ======================================================================= */
+  Secure_Decrypt(b0,b1,b2,b3,b4,b5);
+  write("[IC_RX] STEP 3 - Decrypted Plaintext + Padding");
+  write("[IC_RX] DECRYPTED = [%02X %02X %02X %02X %02X %02X %02X %02X]",globalDecryptedBlock_0,globalDecryptedBlock_1,globalDecryptedBlock_2,globalDecryptedBlock_3,globalDecryptedBlock_4,globalDecryptedBlock_5,globalDecryptedBlock_6,globalDecryptedBlock_7);
+  write("[IC_RX] APPLICATION DATA = [%02X %02X %02X %02X %02X %02X]",globalDecryptedBlock_0,globalDecryptedBlock_1,globalDecryptedBlock_2,globalDecryptedBlock_3, globalDecryptedBlock_4,globalDecryptedBlock_5);
+  
+  /* ======================================================================= */
+  /* STEP 4 - MAC VERIFICATION                                               */
+  /* ======================================================================= */
+  calculated = Generate_Verification_MAC(globalDecryptedBlock_0,globalDecryptedBlock_1,globalDecryptedBlock_2,globalDecryptedBlock_3,globalDecryptedBlock_4,globalDecryptedBlock_5);
+  calculatedMac = calculated;
+  
+  write("[IC_RX] STEP 4 - MAC Verification");
+  write("[IC_RX] Received MAC   = 0x%02X", rxMac);
+  write("[IC_RX] Calculated MAC = 0x%02X", calculatedMac);
+  
+  if (rxMac != calculatedMac)
+  {
+    write("[IC_RX] MAC STATUS   = INVALID");
+    write("[IC_RX] FRAME STATUS = REJECTED");
+    write("============================================================");
+    return;
+  }
+  write("[IC_RX] MAC STATUS = VALID");
+  
+  /* ======================================================================= */
+  /* STEP 5 - MUX SELECTOR                                                   */
+  /* ======================================================================= */
+  selector = globalDecryptedBlock_0 & 0x0F;
+  write("[IC_RX] STEP 5 - MUX Selector = %d", selector);
+  
+  /* ======================================================================= */
+  /* MUX 0                                                                   */
+  /* ======================================================================= */
+  if (selector == 0)
+  {
+    value16 = globalDecryptedBlock_1 |((word)globalDecryptedBlock_2 << 8);
+    gear =(globalDecryptedBlock_0 >> 4) & 0x07;
+    write("[IC_RX] MUX0 - Recovered EMS Signals");
+    write("[IC_RX] Engine Speed       = %d RPM", value16);
+    write("[IC_RX] Engine Temperature = %d C",globalDecryptedBlock_3);
+    write("[IC_RX] Gear Position      = %d", gear);
+    write("[IC_RX] Throttle Position  = %d x 0.5 %%",globalDecryptedBlock_4);
+    write("[IC_RX] IAT                = %d C",globalDecryptedBlock_5 - 40);
+  }
+  
+  /* ======================================================================= */
+  /* MUX 1                                                                   */
+  /* ======================================================================= */
+  else if (selector == 1)
+  {
+    engineStatus =(globalDecryptedBlock_0 >> 4) & 0x03;
+    oilPressure =((globalDecryptedBlock_0 >> 6) & 0x03) |((word)globalDecryptedBlock_1 << 2);
+    engineLoad =globalDecryptedBlock_2;
+    batteryRaw =globalDecryptedBlock_3;
+    fuel =globalDecryptedBlock_4;
+    ignitionRaw =globalDecryptedBlock_5;
+    write("[IC_RX] MUX1 - Recovered EMS Signals");
+    write("[IC_RX] Engine Status     = %d",engineStatus);
+    write("[IC_RX] Oil Pressure      = %d kPa", oilPressure);
+    write("[IC_RX] Engine Load       = %d %%",engineLoad);
+    write("[IC_RX] Battery Raw       = %d", batteryRaw);
+    write("[IC_RX] Fuel Level        = %d %%",fuel);
+    write("[IC_RX] Ignition Advance  = %d x 0.5 deg",ignitionRaw);
+  }
+  
+  /* ======================================================================= */
+  /* MUX 2                                                                   */
+  /* ======================================================================= */
+  else if (selector == 2)
+  {
+    fuel =globalDecryptedBlock_1;
+    maf =globalDecryptedBlock_2;
+    vehicleSpeed =globalDecryptedBlock_3 |((word)globalDecryptedBlock_4 << 8);
+    mapValue =globalDecryptedBlock_5;
+    write("[IC_RX] MUX2 - Recovered EMS Signals");
+    write("[IC_RX] Fuel Level        = %d %%", fuel);
+    write("[IC_RX] MAF               = %d g/s", maf);
+    write("[IC_RX] Vehicle Speed     = %d km/h",vehicleSpeed);
+    write("[IC_RX] MAP               = %d kPa", mapValue);
+  }
+  
+  /* ======================================================================= */
+  /* UNKNOWN MUX                                                             */
+  /* ======================================================================= */
+  else
+  {
+    write("[IC_RX] ERROR - UNKNOWN MUX SELECTOR = %d",selector);
+    write("[IC_RX] FRAME STATUS = REJECTED");
+    write("============================================================");
+    return;
+  }
+
+  /* ======================================================================= */
+  /* SUCCESS                                                                 */
+  /* ======================================================================= */
+  expectedCounter[0] =expectedCounter[0] + 1;
+
+  write("[IC_RX] STEP 6 - Security Verification SUCCESS");
+  write("[IC_RX] Counter     = VALID");
+  write("[IC_RX] MAC         = VALID");
+  write("[IC_RX] Decryption  = SUCCESS");
+  write("[IC_RX] MUX Decode  = SUCCESS");
+  write("[IC_RX] OUTPUT STATUS = SECURE EMS FRAME ACCEPTED");
+  write("============================================================");
+  write("");
+}
+
+/* ------------------------------------------------------------------------- */
+/* ABS 0x110 MUX receiver Block                                              */
+/* ------------------------------------------------------------------------- */
+void VerifyABS_MUX(byte b0, byte b1, byte b2, byte b3,byte b4, byte b5, byte b6, byte b7)
+{
+  byte selector;
+  byte calculated;
+  word value16;
+  word rawLatAccel;      
+  word rawLongAccel;     
+  word rawSteering;      
+  word signed12;
+  byte brakeStatus;
+  byte absActive;
+  byte slipRatio;
+  byte signed10;
+  
+ /* ======================================================================= */
+  /* STEP 1 - RECEIVED CAN FRAME                                             */
+  /* ======================================================================= */
+  rxCounter = b6;
+  rxMac = b7;
+
+  write("");
+  write("============================================================");
+  write("[IC_RX] CAN ID 0x110 - ABS_Sensor_Msg");
+  write("============================================================");
+  write("[IC_RX] STEP 1 - Received CAN Frame");
+  write("[IC_RX] ID   = 0x110");
+  write("[IC_RX] DLC  = 8");
+  write("[IC_RX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]", b0,b1,b2,b3,b4,b5,b6,b7);
+
+  /* ======================================================================= */
+  /* STEP 2 - COUNTER                                                        */
+  /* ======================================================================= */
+  write("[IC_RX] STEP 2 - Counter Verification");
+  write("[IC_RX] Expected Counter = 0x%02X",expectedCounter[1]);
+  write("[IC_RX] Received Counter = 0x%02X",rxCounter);
+  
+  if (rxCounter != expectedCounter[1])
+  {
+    write("[IC_RX] COUNTER STATUS = INVALID");
+    write("[IC_RX] FRAME STATUS   = REJECTED");
+    write("============================================================");
+    return;
+  }
+  write("[IC_RX] COUNTER STATUS = VALID");
+
+  /* ======================================================================= */
+  /* STEP 3 - DECRYPT                                                        */
+  /* ======================================================================= */
+  Secure_Decrypt(b0,b1,b2,b3,b4, b5);
+  write("[IC_RX] STEP 3 - ASCON Decryption");
+  write("[IC_RX] DECRYPTED = [%02X %02X %02X %02X %02X %02X %02X %02X]",globalDecryptedBlock_0,globalDecryptedBlock_1,globalDecryptedBlock_2,globalDecryptedBlock_3,globalDecryptedBlock_4,globalDecryptedBlock_5,globalDecryptedBlock_6,globalDecryptedBlock_7);
+  write("[IC_RX] APPLICATION DATA = [%02X %02X %02X %02X %02X %02X]", globalDecryptedBlock_0,globalDecryptedBlock_1,globalDecryptedBlock_2,globalDecryptedBlock_3,globalDecryptedBlock_4, globalDecryptedBlock_5);
+
+  /* ======================================================================= */
+  /* STEP 4 - MAC                                                             */
+  /* ======================================================================= */
+  calculated = Generate_Verification_MAC(globalDecryptedBlock_0,globalDecryptedBlock_1,globalDecryptedBlock_2, globalDecryptedBlock_3,globalDecryptedBlock_4,globalDecryptedBlock_5);
+  calculatedMac = calculated;
+  write("[IC_RX] STEP 4 - MAC Verification");
+  write("[IC_RX] Received MAC   = 0x%02X", rxMac);
+  write("[IC_RX] Calculated MAC = 0x%02X",calculatedMac);
+  
+  if (rxMac != calculatedMac)
+  {
+    write("[IC_RX] MAC STATUS   = INVALID");
+    write("[IC_RX] FRAME STATUS = REJECTED");
+    write("============================================================");
+    return;
+  }
+  write("[IC_RX] MAC STATUS = VALID");
+
+  /* ======================================================================= */
+  /* STEP 5 - MUX SELECTOR                                                   */
+  /* ======================================================================= */
+  selector =globalDecryptedBlock_0 & 0x0F;
+  write("[IC_RX] STEP 5 - MUX Selector = %d",selector);
+
+  /* ======================================================================= */
+  /* MUX 0 - WHEEL SPEED / ABS STATUS                                        */
+  /* ======================================================================= */
+  if (selector == 0)
+  {
+    value16 =globalDecryptedBlock_1 |((word)globalDecryptedBlock_2 << 8);
+    brakeStatus =(globalDecryptedBlock_0 >> 5) & 0x03;
+    absActive =(globalDecryptedBlock_0 >> 4) & 0x01;
+    slipRatio =globalDecryptedBlock_5;
+    write("[IC_RX] MUX0 - Recovered ABS Signals");
+    write("[IC_RX] Front Wheel Speed Raw = %d",value16);
+    write("[IC_RX] Rear Wheel Speed Raw  = %d",globalDecryptedBlock_3 |((word)globalDecryptedBlock_4 << 8));
+    write("[IC_RX] Brake Status          = %d",brakeStatus);
+    write("[IC_RX] ABS Active             = %d",absActive);
+    write("[IC_RX] Slip Ratio             = %d %%", slipRatio);
+  }
+
+  /* ======================================================================= */
+  /* MUX 1 - YAW / BRAKE                                                      */
+  /* ======================================================================= */
+  else if (selector == 1)
+  {
+    signed12 =((globalDecryptedBlock_0 >> 4) & 0x0F) | ((word)globalDecryptedBlock_1 << 4);
+    value16 =globalDecryptedBlock_2;
+    write("[IC_RX] MUX1 - Recovered ABS Signals");
+    write("[IC_RX] Yaw Rate Raw          = %d",signed12);
+    write("[IC_RX] Brake Pressure Raw    = %d Bar", value16);
+    write("[IC_RX] Brake Temperature Raw = %d",globalDecryptedBlock_3 | ((word)globalDecryptedBlock_4 << 8));
+  }
+
+  /* ======================================================================= */
+  /* MUX 2 - STEERING / ACCELERATION                                          */
+  /* ======================================================================= */
+  else if (selector == 2)
+  {
+    value16 =globalDecryptedBlock_3 | ((word)globalDecryptedBlock_4 << 8);
+    signed10 = ((globalDecryptedBlock_0 >> 4) & 0x0F) |((word)(globalDecryptedBlock_1 & 0x3F) << 4);
+    write("[IC_RX] MUX2 - Recovered ABS Signals");
+    write("[IC_RX] Steering Angle Raw       = %d",value16);
+    write("[IC_RX] Longitudinal Accel Raw   = %d",((globalDecryptedBlock_1 >> 6) & 0x03) | ((word)globalDecryptedBlock_2 << 2));
+    write("[IC_RX] Lateral Accel Raw        = %d", ((globalDecryptedBlock_0 >> 4) & 0x0F) |((word)(globalDecryptedBlock_1 & 0x03) << 4));
+  }
+  
+  /* ======================================================================= */
+  /* UNKNOWN MUX                                                              */
+  /* ======================================================================= */
+  else
+  {
+    write("[IC_RX] UNKNOWN MUX SELECTOR = %d",selector);
+    write("[IC_RX] FRAME STATUS = REJECTED");
+    write("============================================================");
+    return;
+  }
+  
+  /* ======================================================================= */
+  /* SUCCESS                                                                  */
+  /* ======================================================================= */
+  expectedCounter[1] =expectedCounter[1] + 1;
+  write("[IC_RX] STEP 6 - Security Verification SUCCESS");
+  write("[IC_RX] Counter    = VALID");
+  write("[IC_RX] MAC        = VALID");
+  write("[IC_RX] Decryption = SUCCESS");
+  write("[IC_RX] MUX Decode = SUCCESS");
+  write("[IC_RX] OUTPUT STATUS = SECURE ABS FRAME ACCEPTED");
+  write("============================================================");
+  write("");
+}
+
+/* ======================================================================== */
+/* 0x120 ABS Error Message Receiver Module                                  */
+/* ======================================================================== */
+void VerifyABS_Error8( byte b0,  byte b1,  byte b2, byte b3, byte b4, byte b5, byte b6, byte b7)
+{
+  byte calculated;
+  byte idx;
+  word pattern;
+  
+  idx = GetCounterIndex(0x120);
+  rxCounter = b6; 
+  rxMac = b7;
+  if (b0 == 0x00 && b1 == 0x00 && b6 == 0x00) 
+    return;
+  if (firstFrame120 == 1) 
+  { 
+    expectedCounter[idx] = rxCounter; 
+    firstFrame120 = 0; 
+  }
+  if (rxCounter != expectedCounter[idx]) 
+    return;
+  Secure_Decrypt(b0, b1, b2, b3, b4, b5);
+  calculated = Generate_Verification_MAC(globalDecryptedBlock_0, globalDecryptedBlock_1, globalDecryptedBlock_2, globalDecryptedBlock_3, globalDecryptedBlock_4, globalDecryptedBlock_5);
+  if (rxMac != calculated) 
+    return;
+write("");
+  write("[IC_RX] ==================================================");
+  write("[IC_RX] CAN ID 0x120 - ABS_Sensor_Error_msg");
+  write("[IC_RX] ==================================================");
+
+  write("[IC_RX] STEP 1 - Received CAN Frame");
+  write("[IC_RX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+        b0,b1,b2,b3,b4,b5,b6,b7);
+
+  write("[IC_RX] STEP 2 - Counter Verification");
+  write("[IC_RX] Expected Counter = 0x%02X",
+        expectedCounter[idx]);
+
+  write("[IC_RX] Received Counter = 0x%02X",
+        b6);
+
+  write("[IC_RX] COUNTER STATUS = VALID");
+
+  write("[IC_RX] STEP 3 - Decrypted Payload");
+  write("[IC_RX] DECRYPTED = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+        globalDecryptedBlock_0,
+        globalDecryptedBlock_1,
+        globalDecryptedBlock_2,
+        globalDecryptedBlock_3,
+        globalDecryptedBlock_4,
+        globalDecryptedBlock_5,
+        globalDecryptedBlock_6,
+        globalDecryptedBlock_7);
+
+  write("[IC_RX] STEP 4 - MAC Verification");
+  write("[IC_RX] Received MAC   = 0x%02X", b7);
+  write("[IC_RX] Calculated MAC = 0x%02X", calculated);
+
+  write("[IC_RX] MAC STATUS = VALID");
+
+  write("[IC_RX] STEP 5 - ABS Error Payload");
+  write("[IC_RX] Payload = [%02X %02X %02X %02X %02X %02X]",
+        globalDecryptedBlock_0,
+        globalDecryptedBlock_1,
+        globalDecryptedBlock_2,
+        globalDecryptedBlock_3,
+        globalDecryptedBlock_4,
+        globalDecryptedBlock_5);
+
+  write("[IC_RX] OUTPUT STATUS = SECURE ABS ERROR FRAME ACCEPTED");
+  write("[IC_RX] ==================================================");
+}
+
+/* ------------------------------------------------------------------------- */
+/* EMS_Error_Msg 0x101 Handler                                               */
+/* ------------------------------------------------------------------------- */
+void VerifyEMS_Error4( byte b0,  byte b1,  byte b2,  byte b3)
+{
+  byte calculated;
+  byte idx;
+  
+  write("");
+  write("============================================================");
+  write("[IC_RX] CAN ID 0x101 - EMS_Error_Msg");
+  write("============================================================");
+  
+  /* STEP 1 - Received CAN Frame  */
+  write("[IC_RX] STEP 1 - Received CAN Frame");
+  write("[IC_RX] ID   = 0x101");
+  write("[IC_RX] DLC  = 4");
+  write("[IC_RX] DATA = [%02X %02X %02X %02X]",b0,b1,b2,b3);
+  
+  /* STEP 2 - Error / Status Data      */
+  write("[IC_RX] STEP 2 - EMS Error / Status Data");
+  write("[IC_RX] Error Byte 0 = 0x%02X",b0);
+  write("[IC_RX] Status Byte 1 = 0x%02X",b1);
+  
+  /* STEP 3 - Counter     */
+  idx = GetCounterIndex(0x101);
+  rxCounter = b2;
+  rxMac = b3;
+  write("[IC_RX] STEP 3 - Counter Verification");
+  write("[IC_RX] Expected Counter = 0x%02X", expectedCounter[idx]);
+  write("[IC_RX] Received Counter = 0x%02X",rxCounter);
+  if (rxCounter != expectedCounter[idx])
+  {
+    write("[IC_RX] COUNTER STATUS = INVALID");
+    write("[IC_RX] FRAME STATUS   = REJECTED");
+    write("============================================================");
+    return;
+  }
+  write("[IC_RX] COUNTER STATUS = VALID");
+  
+  /* -------------------------------------------------------- */
+  /* STEP 4 - MAC CALCULATION & VERIFICATION                  */
+  /* -------------------------------------------------------- */
+  // FIX: Calculate the MAC using application bytes b0 and b1. Padded with 0x00 for empty bytes.
+  calculated = Generate_Verification_MAC(b0, b1, 0x00, 0x00, 0x00, 0x00);
+  calculatedMac = calculated;
+
+  write("[IC_RX] STEP 4 - MAC");
+  write("[IC_RX] Received MAC   = 0x%02X", rxMac);
+  write("[IC_RX] Calculated MAC = 0x%02X", calculatedMac);
+
+  /* ======================================================================= */
+  /* MAC COMPARISON                                                          */
+  /* ======================================================================= */
+  if (rxMac != calculatedMac)
+  {
+    write("[IC_RX] MAC STATUS   = INVALID");
+    write("[IC_RX] FRAME STATUS = REJECTED");
+    write("============================================================");
+    write("");
+    return;
+  }
+  write("[IC_RX] MAC STATUS = VALID");
+
+  /* ======================================================================= */
+  /* STEP 5 - RECOVERED EMS ERROR INFORMATION                                */
+  /* ======================================================================= */
+  write("[IC_RX] STEP 5 - Recovered EMS Error Information");
+  write("[IC_RX] Recovered Error Data  = 0x%02X",b0);
+  write("[IC_RX] Recovered Status Data = 0x%02X", b1);
+
+  /* Individual error bits */
+  write("[IC_RX] Error Bit 0 = %d",(b0 >> 0) & 0x01);
+  write("[IC_RX] Error Bit 1 = %d",(b0 >> 1) & 0x01);
+  write("[IC_RX] Error Bit 2 = %d",(b0 >> 2) & 0x01);
+  write("[IC_RX] Error Bit 3 = %d",(b0 >> 3) & 0x01);
+  write("[IC_RX] Error Bit 4 = %d",(b0 >> 4) & 0x01);
+  write("[IC_RX] Error Bit 5 = %d",(b0 >> 5) & 0x01);
+  write("[IC_RX] Error Bit 6 = %d",(b0 >> 6) & 0x01);
+  write("[IC_RX] Error Bit 7 = %d",(b0 >> 7) & 0x01);
+
+  /* ======================================================================= */
+  /* STEP 6 - SUCCESS                                                        */
+  /* ======================================================================= */
+  expectedCounter[idx] = expectedCounter[idx] + 1;
+
+  write("[IC_RX] STEP 6 - Security Verification SUCCESS");
+  write("[IC_RX] Counter     = VALID");
+  write("[IC_RX] MAC         = VALID");
+  write("[IC_RX] Error Data  = RECEIVED");
+  write("[IC_RX] OUTPUT STATUS = SECURE EMS ERROR FRAME ACCEPTED");
+  write("============================================================");
+  write("");
+}
+/* ------------------------------------------------------------------------- */
+/* 0x300 Lighting Indication Receiver Module Stub                           */
+/* ------------------------------------------------------------------------- */
+void VerifyLighting_Indication(byte b0, byte b1, byte b2, byte b3, byte b4, byte b5, byte b6, byte b7)
+{
+  byte calculated;
+  byte idx;
+  
+  idx = GetCounterIndex(0x300);
+  rxCounter = b6; 
+  rxMac = b7;
+  
+  if (b0 == 0x00 && b1 == 0x00 && b6 == 0x00) 
+    return;
+    
+  if (firstFrame300 == 1) 
+  { 
+    expectedCounter[idx] = rxCounter; 
+    firstFrame300 = 0; 
+  }
+  
+  if (rxCounter != expectedCounter[idx]) 
+    return;
+    
+  Secure_Decrypt(b0, b1, b2, b3, b4, b5);
+  calculated = Generate_Verification_MAC(globalDecryptedBlock_0, globalDecryptedBlock_1, globalDecryptedBlock_2, globalDecryptedBlock_3, globalDecryptedBlock_4, globalDecryptedBlock_5);
+  
+  if (rxMac != calculated) 
+    return;
+
+  write("");
+  write("[IC_RX] ==================================================");
+  write("[IC_RX] CAN ID 0x300 - Lighting_Indication");
+  write("[IC_RX] ==================================================");
+  write("[IC_RX] STEP 1 - Received CAN Frame");
+  write("[IC_RX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]", b0, b1, b2, b3, b4, b5, b6, b7);
+  write("[IC_RX] STEP 2 - Counter Verification");
+  write("[IC_RX] Expected Counter = 0x%02X | Received = 0x%02X | VALID", expectedCounter[idx], b6);
+  write("[IC_RX] STEP 3 - Decrypted Payload");
+  write("[IC_RX] DECRYPTED = [%02X %02X %02X %02X %02X %02X]", globalDecryptedBlock_0, globalDecryptedBlock_1, globalDecryptedBlock_2, globalDecryptedBlock_3, globalDecryptedBlock_4, globalDecryptedBlock_5);
+  write("[IC_RX] STEP 4 - MAC Verification | VALID");
+  write("[IC_RX] OUTPUT STATUS = SECURE LIGHTING INDICATION FRAME ACCEPTED");
+  write("[IC_RX] ==================================================");
+  
+  expectedCounter[idx] = expectedCounter[idx] + 1;
+}
+
+/* ------------------------------------------------------------------------- */
+/* 0x310 Lighting Error Receiver Module Stub                                 */
+/* ------------------------------------------------------------------------- */
+void VerifyLighting_Error(byte b0, byte b1, byte b2, byte b3, byte b4, byte b5, byte b6, byte b7)
+{
+  byte calculated;
+  byte idx;
+  
+  idx = GetCounterIndex(0x310);
+  rxCounter = b6; 
+  rxMac = b7;
+  
+  if (b0 == 0x00 && b1 == 0x00 && b6 == 0x00) 
+    return;
+    
+  if (firstFrame310 == 1) 
+  { 
+    expectedCounter[idx] = rxCounter; 
+    firstFrame310 = 0; 
+  }
+  
+  if (rxCounter != expectedCounter[idx]) 
+    return;
+    
+  Secure_Decrypt(b0, b1, b2, b3, b4, b5);
+  calculated = Generate_Verification_MAC(globalDecryptedBlock_0, globalDecryptedBlock_1, globalDecryptedBlock_2, globalDecryptedBlock_3, globalDecryptedBlock_4, globalDecryptedBlock_5);
+  
+  if (rxMac != calculated) 
+    return;
+
+  write("");
+  write("[IC_RX] ==================================================");
+  write("[IC_RX] CAN ID 0x310 - Lighting_Error");
+  write("[IC_RX] ==================================================");
+  write("[IC_RX] STEP 1 - Received CAN Frame");
+  write("[IC_RX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]", b0, b1, b2, b3, b4, b5, b6, b7);
+  write("[IC_RX] STEP 2 - Counter Verification");
+  write("[IC_RX] Expected Counter = 0x%02X | Received = 0x%02X | VALID", expectedCounter[idx], b6);
+  write("[IC_RX] STEP 3 - Decrypted Payload");
+  write("[IC_RX] DECRYPTED = [%02X %02X %02X %02X %02X %02X]", globalDecryptedBlock_0, globalDecryptedBlock_1, globalDecryptedBlock_2, globalDecryptedBlock_3, globalDecryptedBlock_4, globalDecryptedBlock_5);
+  write("[IC_RX] STEP 4 - MAC Verification | VALID");
+  write("[IC_RX] OUTPUT STATUS = SECURE LIGHTING ERROR FRAME ACCEPTED");
+  write("[IC_RX] ==================================================");
+  
+  expectedCounter[idx] = expectedCounter[idx] + 1;
+}
+
+/* ------------------------------------------------------------------------- */
+/* 0x320 Keyless Status Receiver Module Stub                                */
+/* ------------------------------------------------------------------------- */
+void VerifyKeyless_Status(byte b0, byte b1, byte b2, byte b3, byte b4, byte b5, byte b6, byte b7)
+{
+  byte calculated;
+  byte idx;
+  
+  idx = GetCounterIndex(0x320);
+  rxCounter = b6; 
+  rxMac = b7;
+  
+  if (b0 == 0x00 && b1 == 0x00 && b6 == 0x00) 
+    return;
+    
+  if (firstFrame320 == 1) 
+  { 
+    expectedCounter[idx] = rxCounter; 
+    firstFrame320 = 0; 
+  }
+  
+  if (rxCounter != expectedCounter[idx]) 
+    return;
+    
+  Secure_Decrypt(b0, b1, b2, b3, b4, b5);
+  calculated = Generate_Verification_MAC(globalDecryptedBlock_0, globalDecryptedBlock_1, globalDecryptedBlock_2, globalDecryptedBlock_3, globalDecryptedBlock_4, globalDecryptedBlock_5);
+  
+  if (rxMac != calculated) 
+    return;
+
+  write("");
+  write("[IC_RX] ==================================================");
+  write("[IC_RX] CAN ID 0x320 - Keyless_Status");
+  write("[IC_RX] ==================================================");
+  write("[IC_RX] STEP 1 - Received CAN Frame");
+  write("[IC_RX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]", b0, b1, b2, b3, b4, b5, b6, b7);
+  write("[IC_RX] STEP 2 - Counter Verification");
+  write("[IC_RX] Expected Counter = 0x%02X | Received = 0x%02X | VALID", expectedCounter[idx], b6);
+  write("[IC_RX] STEP 3 - Decrypted Payload");
+  write("[IC_RX] DECRYPTED = [%02X %02X %02X %02X %02X %02X]", globalDecryptedBlock_0, globalDecryptedBlock_1, globalDecryptedBlock_2, globalDecryptedBlock_3, globalDecryptedBlock_4, globalDecryptedBlock_5);
+  write("[IC_RX] STEP 4 - MAC Verification | VALID");
+  write("[IC_RX] OUTPUT STATUS = SECURE KEYLESS STATUS FRAME ACCEPTED");
+  write("[IC_RX] ==================================================");
+  
+  expectedCounter[idx] = expectedCounter[idx] + 1;
+}
+
+void HandleIC_Diagnostic(
+  byte b0,
+  byte b1,
+  byte b2,
+  byte b3,
+  byte b4,
+  byte b5,
+  byte b6,
+  byte b7)
+{
+  write("");
+  write("============================================================");
+  write("[IC_RX] CAN ID 0x7E2 - Diagnostic Request");
+  write("[IC_RX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+        b0,b1,b2,b3,b4,b5,b6,b7);
+
+  write("[IC_RX] Diagnostic Request Received");
+
+  txIC_DiagResp.id = 0x7EA;
+  txIC_DiagResp.dlc = 8;
+
+  txIC_DiagResp.byte(0) = 0x50;
+  txIC_DiagResp.byte(1) = b1;
+  txIC_DiagResp.byte(2) = 0x00;
+  txIC_DiagResp.byte(3) = 0x00;
+  txIC_DiagResp.byte(4) = 0x00;
+  txIC_DiagResp.byte(5) = 0x00;
+  txIC_DiagResp.byte(6) = 0x00;
+  txIC_DiagResp.byte(7) = 0x00;
+
+  write("[IC_TX] CAN ID 0x7EA - Diagnostic Response");
+  write("[IC_TX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+        txIC_DiagResp.byte(0),
+        txIC_DiagResp.byte(1),
+        txIC_DiagResp.byte(2),
+        txIC_DiagResp.byte(3),
+        txIC_DiagResp.byte(4),
+        txIC_DiagResp.byte(5),
+        txIC_DiagResp.byte(6),
+        txIC_DiagResp.byte(7));
+
+  output(txIC_DiagResp);
+
+  write("[IC_TX] 0x7EA DIAGNOSTIC RESPONSE TRANSMITTED");
+  write("============================================================");
+}
+
+on message *
+{
+  dword id;
+  byte b0; 
+  byte b1; 
+  byte b2; 
+  byte b3; 
+  byte b4; 
+  byte b5; 
+  byte b6; 
+  byte b7;
+  
+  id = this.id;
+  if (this.dlc < 1) 
+    return;
+  // Rapidly unload current byte payload configurations out of the bus interface
+  b0 = this.byte(0); 
+  b1 = 0; 
+  b2 = 0; 
+  b3 = 0; 
+  b4 = 0; 
+  b5 = 0;
+  b6 = 0; 
+  b7 = 0;
+  
+  if (this.dlc > 1) b1 = this.byte(1); 
+  if (this.dlc > 2) b2 = this.byte(2);
+  if (this.dlc > 3) b3 = this.byte(3); 
+  if (this.dlc > 4) b4 = this.byte(4);
+  if (this.dlc > 5) b5 = this.byte(5); 
+  if (this.dlc > 6) b6 = this.byte(6);
+  if (this.dlc > 7) b7 = this.byte(7);
+  // Match the message ID to its parsing routine
+  switch (id)
+  {
+    case 0x100: // EMS_Data_Msg
+      if (this.dlc == 8) 
+        VerifyEMS_MUX(b0, b1, b2, b3, b4, b5, b6, b7);
+      break;
+    
+    case 0x110: // ABS_Sensor_Msg
+      if (this.dlc == 8) 
+        VerifyABS_MUX(b0, b1, b2, b3, b4, b5, b6, b7);
+      break;
+    
+    case 0x120: // ABS_Sensor_Error_msg
+      if (this.dlc == 8) 
+        VerifyABS_Error8(b0, b1, b2, b3, b4, b5, b6, b7);
+      break;
+    
+    case 0x101: // EMS_Error_Msg
+      if (this.dlc == 4) 
+        VerifyEMS_Error4(b0, b1, b2, b3);
+      break;
+    
+    case 0x130: // Dec 304 : Cluster Indication
+      if (this.dlc == 8)
+      {
+        Secure_Decrypt(b0, b1, b2, b3, b4, b5); 
+      }
+      break;  
+    
+    case 0x300:
+      if (this.dlc == 8)
+        VerifyLighting_Indication(b0,b1,b2,b3,b4,b5,b6,b7);
+      break;
+
+    case 0x310:
+      if (this.dlc == 8)
+        VerifyLighting_Error(b0,b1,b2,b3,b4,b5,b6,b7);
+      break;
+
+    case 0x320:
+      if (this.dlc == 8)
+        VerifyKeyless_Status(b0,b1,b2,b3,b4,b5,b6,b7);
+      break;
+      
+    case 0x7E2:
+      if (this.dlc >= 2)
+        HandleIC_Diagnostic(this.byte(0),this.byte(1),this.byte(2),this.byte(3),this.byte(4),this.byte(5),this.byte(6),this.byte(7));
+      break; 
+      
+      default:
+      break;
+  }
+}

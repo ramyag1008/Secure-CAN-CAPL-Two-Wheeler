@@ -1,0 +1,608 @@
+﻿/*@!Encoding:65001*/
+/*
+ * KEYLESS ECU
+ *
+ * Secure Message:
+ *   0x320 - Keyless_Status
+ *
+ * Non-Secure Messages:
+ *   0x351 - Keyless Wake Request
+ *   0x7E4 - Diagnostic Request
+ *   0x7EC - Diagnostic Response
+ *
+ * Secure CAN format:
+ *
+ *   Byte 0-5 : ASCON encrypted application data
+ *   Byte 6   : Freshness Counter
+ *   Byte 7   : MAC
+ */
+
+variables
+{
+  /* ============================================================
+     ECU STATE
+     ============================================================ */
+
+  byte keylessActive = 0;
+
+  /* ============================================================
+     TIMER
+     ============================================================ */
+
+  msTimer txKeylessTimer;
+
+  /* ============================================================
+     COUNTER
+     ============================================================ */
+
+  byte txCounter320 = 0;
+
+  /* ============================================================
+     CAN MESSAGES
+     ============================================================ */
+
+  message 0x320 txKeylessStatus;
+  message 0x7EC txKeylessDiagResp;
+
+  /* ============================================================
+     APPLICATION DATA
+     ============================================================ */
+
+  byte raw0;
+  byte raw1;
+  byte raw2;
+  byte raw3;
+  byte raw4;
+  byte raw5;
+
+  /* ============================================================
+     ASCON STATE
+     ============================================================ */
+
+  dword x0_h;
+  dword x0_l;
+
+  dword x1_h;
+  dword x1_l;
+
+  dword x2_h;
+  dword x2_l;
+
+  dword x3_h;
+  dword x3_l;
+
+  dword x4_h;
+  dword x4_l;
+
+  /* ============================================================
+     PADDING
+     ============================================================ */
+
+  byte pad0;
+  byte pad1;
+  byte pad2;
+  byte pad3;
+  byte pad4;
+  byte pad5;
+  byte pad6;
+  byte pad7;
+
+  /* ============================================================
+     CIPHERTEXT
+     ============================================================ */
+
+  byte cipher0;
+  byte cipher1;
+  byte cipher2;
+  byte cipher3;
+  byte cipher4;
+  byte cipher5;
+
+  /* ============================================================
+     MAC
+     ============================================================ */
+
+  byte computedMac;
+}
+
+
+/* ================================================================
+   ASCON ROTATION
+   ================================================================ */
+
+dword RotateRight_H(dword h, dword l, int n)
+{
+  if (n < 32)
+    return (h >> n) | (l << (32 - n));
+
+  return (l >> (n - 32)) | (h << (64 - n));
+}
+
+
+dword RotateRight_L(dword h, dword l, int n)
+{
+  if (n < 32)
+    return (l >> n) | (h << (32 - n));
+
+  return (h >> (n - 32)) | (l << (64 - n));
+}
+
+
+/* ================================================================
+   ASCON INITIALIZATION
+   ================================================================ */
+
+void Ascon_Initialize_State()
+{
+  x0_h = 0x80400c06;
+  x0_l = 0x00000000;
+
+  x1_h = 0x01020304;
+  x1_l = 0x05060708;
+
+  x2_h = 0x090A0B0C;
+  x2_l = 0x0D0E0F10;
+
+  x3_h = 0x00000000;
+  x3_l = 0x00000000;
+
+  x4_h = 0x00000000;
+  x4_l = 0x00000000;
+
+  Ascon_Permute_6();
+}
+
+
+/* ================================================================
+   ASCON PERMUTATION
+   ================================================================ */
+
+void Ascon_Permute_6()
+{
+  int r;
+
+  dword t0_h;
+  dword t0_l;
+  dword t1_h;
+  dword t1_l;
+  dword t2_h;
+  dword t2_l;
+  dword t3_h;
+  dword t3_l;
+  dword t4_h;
+  dword t4_l;
+
+  byte current_rc;
+
+  for (r = 0; r < 6; r++)
+  {
+    switch (r)
+    {
+      case 0:
+        current_rc = 0x9A;
+        break;
+
+      case 1:
+        current_rc = 0x8B;
+        break;
+
+      case 2:
+        current_rc = 0x7C;
+        break;
+
+      case 3:
+        current_rc = 0x6D;
+        break;
+
+      case 4:
+        current_rc = 0x5E;
+        break;
+
+      case 5:
+        current_rc = 0x4F;
+        break;
+
+      default:
+        current_rc = 0x00;
+        break;
+    }
+
+    x2_l = x2_l ^ current_rc;
+
+    x0_h = x0_h ^ x4_h;
+    x0_l = x0_l ^ x4_l;
+
+    x4_h = x4_h ^ x3_h;
+    x4_l = x4_l ^ x3_l;
+
+    x2_h = x2_h ^ x1_h;
+    x2_l = x2_l ^ x1_l;
+
+    t0_h = ~x0_h;
+    t0_l = ~x0_l;
+
+    t1_h = ~x1_h;
+    t1_l = ~x1_l;
+
+    t2_h = ~x2_h;
+    t2_l = ~x2_l;
+
+    t3_h = ~x3_h;
+    t3_l = ~x3_l;
+
+    t4_h = ~x4_h;
+    t4_l = ~x4_l;
+
+    x0_h = x0_h ^ (t1_h & x2_h);
+    x0_l = x0_l ^ (t1_l & x2_l);
+
+    x1_h = x1_h ^ (t2_h & x3_h);
+    x1_l = x1_l ^ (t2_l & x3_l);
+
+    x2_h = x2_h ^ (t3_h & x4_h);
+    x2_l = x2_l ^ (t3_l & x4_l);
+
+    x3_h = x3_h ^ (t4_h & t0_h);
+    x3_l = x3_l ^ (t4_l & t0_l);
+
+    x4_h = x4_h ^ (t0_h & x1_h);
+    x4_l = x4_l ^ (t0_l & x1_l);
+
+    x1_h = x1_h ^ x0_h;
+    x1_l = x1_l ^ x0_l;
+
+    x0_h = x0_h ^ x4_h;
+    x0_l = x0_l ^ x4_l;
+
+    x3_h = x3_h ^ x2_h;
+    x3_l = x3_l ^ x2_l;
+
+    x2_h = ~x2_h;
+    x2_l = ~x2_l;
+
+    t0_h = x0_h;
+    t0_l = x0_l;
+
+    x0_h = x0_h
+          ^ RotateRight_H(t0_h,t0_l,19)
+          ^ RotateRight_H(t0_h,t0_l,28);
+
+    x0_l = x0_l
+          ^ RotateRight_L(t0_h,t0_l,19)
+          ^ RotateRight_L(t0_h,t0_l,28);
+
+    t1_h = x1_h;
+    t1_l = x1_l;
+
+    x1_h = x1_h
+          ^ RotateRight_H(t1_h,t1_l,61)
+          ^ RotateRight_H(t1_h,t1_l,39);
+
+    x1_l = x1_l
+          ^ RotateRight_L(t1_h,t1_l,61)
+          ^ RotateRight_L(t1_h,t1_l,39);
+
+    t2_h = x2_h;
+    t2_l = x2_l;
+
+    x2_h = x2_h
+          ^ RotateRight_H(t2_h,t2_l,1)
+          ^ RotateRight_H(t2_h,t2_l,6);
+
+    x2_l = x2_l
+          ^ RotateRight_L(t2_h,t2_l,1)
+          ^ RotateRight_L(t2_h,t2_l,6);
+
+    t3_h = x3_h;
+    t3_l = x3_l;
+
+    x3_h = x3_h
+          ^ RotateRight_H(t3_h,t3_l,10)
+          ^ RotateRight_H(t3_h,t3_l,17);
+
+    x3_l = x3_l
+          ^ RotateRight_L(t3_h,t3_l,10)
+          ^ RotateRight_L(t3_h,t3_l,17);
+
+    t4_h = x4_h;
+    t4_l = x4_l;
+
+    x4_h = x4_h
+          ^ RotateRight_H(t4_h,t4_l,7)
+          ^ RotateRight_H(t4_h,t4_l,41);
+
+    x4_l = x4_l
+          ^ RotateRight_L(t4_h,t4_l,7)
+          ^ RotateRight_L(t4_h,t4_l,41);
+  }
+}
+
+
+/* ================================================================
+   ENCRYPT SIX BYTES
+   ================================================================ */
+
+void EncryptSixBytes(
+  byte r0,
+  byte r1,
+  byte r2,
+  byte r3,
+  byte r4,
+  byte r5)
+{
+  dword msg_h;
+  dword msg_l;
+
+  pad0 = r0;
+  pad1 = r1;
+  pad2 = r2;
+  pad3 = r3;
+
+  pad4 = r4;
+  pad5 = r5;
+
+  pad6 = 0x02;
+  pad7 = 0x02;
+
+  Ascon_Initialize_State();
+
+  msg_h =
+      ((dword)pad0 << 24)
+    | ((dword)pad1 << 16)
+    | ((dword)pad2 << 8)
+    |  (dword)pad3;
+
+  msg_l =
+      ((dword)pad4 << 24)
+    | ((dword)pad5 << 16)
+    | ((dword)pad6 << 8)
+    |  (dword)pad7;
+
+  x0_h = x0_h ^ msg_h;
+  x0_l = x0_l ^ msg_l;
+
+  cipher0 = (byte)((x0_h >> 24) & 0xFF);
+  cipher1 = (byte)((x0_h >> 16) & 0xFF);
+  cipher2 = (byte)((x0_h >> 8)  & 0xFF);
+  cipher3 = (byte)(x0_h & 0xFF);
+
+  cipher4 = (byte)((x0_l >> 24) & 0xFF);
+  cipher5 = (byte)((x0_l >> 16) & 0xFF);
+}
+
+
+/* ================================================================
+   MAC
+   ================================================================ */
+
+byte Generate_Local_MAC()
+{
+  Ascon_Permute_6();
+
+  return (byte)(x3_l & 0xFF);
+}
+
+
+/* ================================================================
+   START
+   ================================================================ */
+
+on start
+{
+  keylessActive = 0;
+
+  txCounter320 = 0;
+
+  write("");
+  write("============================================================");
+  write("[KEYLESS] ECU INITIALIZED");
+  write("[KEYLESS] Initial State = SLEEP");
+  write("[KEYLESS] Secure ID = 0x320");
+  write("[KEYLESS] Plain IDs = 0x351, 0x7E4, 0x7EC");
+  write("============================================================");
+}
+
+
+/* ================================================================
+   0x320 KEYLESS STATUS TX
+   ================================================================ */
+
+on timer txKeylessTimer
+{
+  if (keylessActive == 0)
+    return;
+
+  /*
+   * Replace raw0...raw5 with the actual 0x320 DBC
+   * application signal values if required.
+   */
+
+  raw0 = 0x01;
+  raw1 = 0x00;
+  raw2 = 0x00;
+  raw3 = 0x00;
+  raw4 = 0x00;
+  raw5 = 0x00;
+
+  write("");
+  write("============================================================");
+  write("[KEYLESS_TX] CAN ID 0x320 - Keyless_Status");
+  write("============================================================");
+
+  write("[KEYLESS_TX] STEP 1 - APPLICATION INPUT");
+  write("[KEYLESS_TX] Plaintext = [%02X %02X %02X %02X %02X %02X]",
+        raw0,raw1,raw2,raw3,raw4,raw5);
+
+  /* ASCON encryption */
+
+  EncryptSixBytes(
+    raw0,raw1,raw2,raw3,raw4,raw5);
+
+  write("[KEYLESS_TX] STEP 2 - ASCON ENCRYPTION");
+  write("[KEYLESS_TX] Ciphertext = [%02X %02X %02X %02X %02X %02X]",
+        cipher0,cipher1,cipher2,
+        cipher3,cipher4,cipher5);
+
+  /* MAC */
+
+  computedMac = Generate_Local_MAC();
+
+  write("[KEYLESS_TX] STEP 3 - COUNTER");
+  write("[KEYLESS_TX] Counter = 0x%02X",txCounter320);
+
+  write("[KEYLESS_TX] STEP 4 - MAC");
+  write("[KEYLESS_TX] MAC = 0x%02X",computedMac);
+
+  /* FINAL FRAME */
+
+  txKeylessStatus.id = 0x320;
+  txKeylessStatus.dlc = 8;
+
+  txKeylessStatus.byte(0) = cipher0;
+  txKeylessStatus.byte(1) = cipher1;
+  txKeylessStatus.byte(2) = cipher2;
+  txKeylessStatus.byte(3) = cipher3;
+  txKeylessStatus.byte(4) = cipher4;
+  txKeylessStatus.byte(5) = cipher5;
+
+  txKeylessStatus.byte(6) = txCounter320;
+  txKeylessStatus.byte(7) = computedMac;
+
+  write("[KEYLESS_TX] STEP 5 - FINAL CAN FRAME");
+  write("[KEYLESS_TX] ID = 0x320");
+  write("[KEYLESS_TX] DLC = 8");
+
+  write("[KEYLESS_TX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+        txKeylessStatus.byte(0),
+        txKeylessStatus.byte(1),
+        txKeylessStatus.byte(2),
+        txKeylessStatus.byte(3),
+        txKeylessStatus.byte(4),
+        txKeylessStatus.byte(5),
+        txKeylessStatus.byte(6),
+        txKeylessStatus.byte(7));
+
+  output(txKeylessStatus);
+
+  write("[KEYLESS_TX] 0x320 FRAME TRANSMITTED");
+  write("============================================================");
+
+  txCounter320++;
+
+  setTimer(txKeylessTimer,100);
+}
+
+
+/* ================================================================
+   RX - WAKE / DIAGNOSTIC
+   ================================================================ */
+
+on message *
+{
+  switch(this.id)
+  {
+
+    /* ============================================================
+       0x351 - KEYLESS WAKE
+       NON-SECURE
+       ============================================================ */
+
+    case 0x351:
+
+      write("");
+      write("============================================================");
+      write("[KEYLESS_RX] CAN ID 0x351 - Keyless ECU Wake");
+      write("============================================================");
+
+      write("[KEYLESS_RX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+            this.byte(0),
+            this.byte(1),
+            this.byte(2),
+            this.byte(3),
+            this.byte(4),
+            this.byte(5),
+            this.byte(6),
+            this.byte(7));
+
+      if (this.byte(0) == 0x01)
+      {
+        keylessActive = 1;
+
+        write("[KEYLESS_RX] WAKE REQUEST = VALID");
+        write("[KEYLESS_RX] TARGET = KEYLESS");
+        write("[KEYLESS_RX] ECU STATE = ACTIVE");
+
+        setTimer(txKeylessTimer,100);
+      }
+      else
+      {
+        write("[KEYLESS_RX] WAKE REQUEST = INVALID");
+      }
+
+      break;
+
+
+    /* ============================================================
+       0x7E4 - DIAGNOSTIC REQUEST
+       NON-SECURE
+       ============================================================ */
+
+    case 0x7E4:
+
+      write("");
+      write("============================================================");
+      write("[KEYLESS_RX] CAN ID 0x7E4 - Diagnostic Request");
+      write("============================================================");
+
+      write("[KEYLESS_RX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+            this.byte(0),
+            this.byte(1),
+            this.byte(2),
+            this.byte(3),
+            this.byte(4),
+            this.byte(5),
+            this.byte(6),
+            this.byte(7));
+
+      if (keylessActive == 1)
+      {
+        txKeylessDiagResp.id = 0x7EC;
+        txKeylessDiagResp.dlc = 8;
+
+        txKeylessDiagResp.byte(0) = 0x50;
+        txKeylessDiagResp.byte(1) = this.byte(1);
+        txKeylessDiagResp.byte(2) = 0x00;
+        txKeylessDiagResp.byte(3) = 0x00;
+        txKeylessDiagResp.byte(4) = 0x00;
+        txKeylessDiagResp.byte(5) = 0x00;
+        txKeylessDiagResp.byte(6) = 0x00;
+        txKeylessDiagResp.byte(7) = 0x00;
+
+        write("[KEYLESS_TX] CAN ID 0x7EC - Diagnostic Response");
+
+        write("[KEYLESS_TX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+              txKeylessDiagResp.byte(0),
+              txKeylessDiagResp.byte(1),
+              txKeylessDiagResp.byte(2),
+              txKeylessDiagResp.byte(3),
+              txKeylessDiagResp.byte(4),
+              txKeylessDiagResp.byte(5),
+              txKeylessDiagResp.byte(6),
+              txKeylessDiagResp.byte(7));
+
+        output(txKeylessDiagResp);
+
+        write("[KEYLESS_TX] 0x7EC DIAGNOSTIC RESPONSE TRANSMITTED");
+      }
+      else
+      {
+        write("[KEYLESS_RX] DIAGNOSTIC REQUEST IGNORED - ECU SLEEP");
+      }
+
+      break;
+
+
+    default:
+      break;
+  }
+}

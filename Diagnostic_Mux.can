@@ -1,0 +1,175 @@
+﻿/*@!Encoding:65001*/
+variables
+{
+  msTimer diagnosticTimer;
+
+  byte diagTarget = 0;
+  int randomService = 0;
+  long randomInterval = 0;
+  
+  message 0x7E0 diagEMSReq;
+  message 0x7E1 diagABSReq;
+  message 0x7E2 diagICReq;
+  message 0x7E3 diagLightingReq;
+  message 0x7E4 diagKeylessReq;
+}
+
+on start
+{
+  diagTarget = 0;
+
+  write("============================================================");
+  write("[DIAG] Diagnostic Tester INITIALIZED");
+  write("[DIAG] Diagnostic cycle = 1 second");
+  write("============================================================");
+
+  setTimer(diagnosticTimer, 20);
+}
+
+on timer diagnosticTimer
+{
+    // 1. Randomly select an ECU target (0 = EMS, 1 = ABS, 2 = IC, 3 = Lighting, 4 = Keyless)
+  diagTarget = random(5);
+
+  // 2. Randomly select a UDS Diagnostic Service (0 = Read DTC Info, 1 = Session Control)
+  randomService = random(2);
+  
+   // --- EMS Request (0x7E0) ---
+  if (diagTarget == 0)
+  {
+    diagEMSReq.id = 0x7E0;
+    diagEMSReq.dlc = 8;
+    if (randomService == 0) {
+      diagEMSReq.byte(0) = 0x19; // Service 0x19: Read DTCs
+      diagEMSReq.byte(1) = 0x02; // Sub-function
+    } else {
+      diagEMSReq.byte(0) = 0x10; // Service 0x10: Diagnostic Session Control
+      diagEMSReq.byte(1) = 0x03; // Extended Diagnostic Session
+    }
+    diagEMSReq.byte(2) = 0x00; diagEMSReq.byte(3) = 0x00; diagEMSReq.byte(4) = 0x00;
+    diagEMSReq.byte(5) = 0x00; diagEMSReq.byte(6) = 0x00; diagEMSReq.byte(7) = 0x00;
+
+    write("[DIAG_TX] 0x7E0 - EMS Random Diagnostic Request (Service 0x%02X)", diagEMSReq.byte(0));
+    output(diagEMSReq);
+  }
+  
+  // --- ABS Request (0x7E1) ---
+  else if (diagTarget == 1)
+   {
+    diagABSReq.id = 0x7E1;
+    diagABSReq.dlc = 8;
+    if (randomService == 0) {
+      diagABSReq.byte(0) = 0x19;
+      diagABSReq.byte(1) = 0x02;
+    } else {
+      diagABSReq.byte(0) = 0x10;
+      diagABSReq.byte(1) = 0x03;
+    }
+    diagABSReq.byte(2) = 0x00; diagABSReq.byte(3) = 0x00; diagABSReq.byte(4) = 0x00;
+    diagABSReq.byte(5) = 0x00; diagABSReq.byte(6) = 0x00; diagABSReq.byte(7) = 0x00;
+
+    write("[DIAG_TX] 0x7E1 - ABS Random Diagnostic Request (Service 0x%02X)", diagABSReq.byte(0));
+    output(diagABSReq);
+  }
+
+    // --- IC Request (0x7E2) ---
+  else if (diagTarget == 2)
+  {
+    diagICReq.id = 0x7E2;
+    diagICReq.dlc = 8;
+    if (randomService == 0) {
+      diagICReq.byte(0) = 0x19;
+      diagICReq.byte(1) = 0x02;
+    } else {
+      diagICReq.byte(0) = 0x10;
+      diagICReq.byte(1) = 0x03;
+    }
+    diagICReq.byte(2) = 0x00; diagICReq.byte(3) = 0x00; diagICReq.byte(4) = 0x00;
+    diagICReq.byte(5) = 0x00; diagICReq.byte(6) = 0x00; diagICReq.byte(7) = 0x00;
+
+    write("[DIAG_TX] 0x7E2 - IC Random Diagnostic Request (Service 0x%02X)", diagICReq.byte(0));
+    output(diagICReq);
+  }
+
+  // --- Lighting Request (0x7E3) ---
+  else if (diagTarget == 3)
+  {
+    diagLightingReq.id = 0x7E3;
+    diagLightingReq.dlc = 8;
+    if (randomService == 0) {
+      diagLightingReq.byte(0) = 0x19;
+      diagLightingReq.byte(1) = 0x02;
+    } else {
+      diagLightingReq.byte(0) = 0x10;
+      diagLightingReq.byte(1) = 0x03;
+    }
+    diagLightingReq.byte(2) = 0x00; diagLightingReq.byte(3) = 0x00; diagLightingReq.byte(4) = 0x00;
+    diagLightingReq.byte(5) = 0x00; diagLightingReq.byte(6) = 0x00; diagLightingReq.byte(7) = 0x00;
+
+    write("[DIAG_TX] 0x7E3 - Lighting Random Diagnostic Request (Service 0x%02X)", diagLightingReq.byte(0));
+    output(diagLightingReq);
+  }
+
+  // --- Keyless Request (0x7E4) ---
+  else
+  {
+    diagKeylessReq.id = 0x7E4;
+    diagKeylessReq.dlc = 8;
+    if (randomService == 0) {
+      diagKeylessReq.byte(0) = 0x19;
+      diagKeylessReq.byte(1) = 0x02;
+    } else {
+      diagKeylessReq.byte(0) = 0x10;
+      diagKeylessReq.byte(1) = 0x03;
+    }
+    diagKeylessReq.byte(2) = 0x00; diagKeylessReq.byte(3) = 0x00; diagKeylessReq.byte(4) = 0x00;
+    diagKeylessReq.byte(5) = 0x00; diagKeylessReq.byte(6) = 0x00; diagKeylessReq.byte(7) = 0x00;
+
+    write("[DIAG_TX] 0x7E4 - Keyless Random Diagnostic Request (Service 0x%02X)", diagKeylessReq.byte(0));
+    output(diagKeylessReq);
+  }
+
+  // 3. FIX: Generate a rapid, randomized cycle interval between 15ms and 50ms to drive up bus load
+  randomInterval = 15 + random(36); 
+  setTimer(diagnosticTimer, randomInterval);
+}
+on message *
+{
+  switch(this.id)
+  {
+    case 0x7E8:
+      write("[DIAG_RX] 0x7E8 - EMS Diagnostic Response");
+      write("[DIAG_RX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+            this.byte(0),this.byte(1),this.byte(2),this.byte(3),
+            this.byte(4),this.byte(5),this.byte(6),this.byte(7));
+      break;
+
+    case 0x7E9:
+      write("[DIAG_RX] 0x7E9 - ABS Diagnostic Response");
+      write("[DIAG_RX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+            this.byte(0),this.byte(1),this.byte(2),this.byte(3),
+            this.byte(4),this.byte(5),this.byte(6),this.byte(7));
+      break;
+
+    case 0x7EA:
+      write("[DIAG_RX] 0x7EA - IC Diagnostic Response");
+      write("[DIAG_RX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+            this.byte(0),this.byte(1),this.byte(2),this.byte(3),
+            this.byte(4),this.byte(5),this.byte(6),this.byte(7));
+      break;
+
+    case 0x7EB:
+      write("[DIAG_RX] 0x7EB - Lighting Diagnostic Response");
+      write("[DIAG_RX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+            this.byte(0),this.byte(1),this.byte(2),this.byte(3),
+            this.byte(4),this.byte(5),this.byte(6),this.byte(7));
+      break;
+
+    case 0x7EC:
+      write("[DIAG_RX] 0x7EC - Keyless Diagnostic Response");
+      write("[DIAG_RX] DATA = [%02X %02X %02X %02X %02X %02X %02X %02X]",
+            this.byte(0),this.byte(1),this.byte(2),this.byte(3),
+            this.byte(4),this.byte(5),this.byte(6),this.byte(7));
+      break;
+  }
+}
